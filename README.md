@@ -26,3 +26,5 @@ app/server.py               Whisper STT → app/processor.py → TTS
 4. Replug the Nest.
 
 `./run.sh restart|stop|logs|uninstall` · tasks: http://127.0.0.1:53412 · tests: `.venv/bin/python -m unittest discover -s tests`
+
+License: GPL-3.0, see `LICENSE`.

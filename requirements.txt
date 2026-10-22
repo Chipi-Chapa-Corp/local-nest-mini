@@ -1,0 +1,2 @@
+mitmproxy==12.3.0
+pychromecast==14.0.10

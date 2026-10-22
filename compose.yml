@@ -1,0 +1,65 @@
+services:
+  proxy:
+    image: local-nest-mini:latest
+    build:
+      context: .
+      dockerfile: Containerfile
+    network_mode: host
+    init: true
+    security_opt:
+      - label=disable
+    env_file:
+      - config.env
+    environment:
+      DATA_DIR: /data
+      PROXY_CONFIG: /app/proxy-config
+    volumes:
+      - ./data:/data
+      - ./proxy-config:/app/proxy-config:ro
+    command: ["/app/start-proxy.sh"]
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 18445), 2); s.close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  assistant:
+    image: local-nest-mini:latest
+    build:
+      context: .
+      dockerfile: Containerfile
+    network_mode: host
+    init: true
+    security_opt:
+      - label=disable
+    env_file:
+      - config.env
+    environment:
+      DATA_DIR: /data
+      TTS_DIR: /data/tts
+      STT_MODEL: /app/models/stt/futo.bin
+      WHISPER_BIN: /usr/local/bin/whisper-cli
+      POCKET_BIN: /usr/local/bin/pocket-tts
+      RU_CONFIG: /app/models/ru/config.yaml
+      RU_VOICE: /app/models/voices/ru.safetensors
+      LISTEN_HOST: 0.0.0.0
+      LISTEN_PORT: "8099"
+      STT_THREADS: "6"
+      PLAYER_ENABLED: "1"
+      CAST_NAME: Office speaker
+    mem_limit: 3g
+    memswap_limit: 3g
+    volumes:
+      - ./data:/data
+    restart: "no"
+    depends_on:
+      proxy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8099/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 5s

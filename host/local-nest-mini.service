@@ -1,0 +1,29 @@
+[Unit]
+Description=Local Nest Mini proxy, assistant, and network helper
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/home/kitkat/Projects/IoT/local-nest-mini
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/bash /var/home/kitkat/Projects/IoT/local-nest-mini/host/service-run.sh
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+UMask=0077
+MemoryHigh=2G
+MemoryMax=3G
+MemorySwapMax=512M
+TasksMax=256
+OOMPolicy=stop
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=local-nest-mini
+
+[Install]
+WantedBy=multi-user.target

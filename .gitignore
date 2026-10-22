@@ -1,0 +1,20 @@
+# Local config, secrets, runtime output
+config.env
+proxy-config/
+data/
+*.jsonl
+*.log
+*.mitm
+proxy.pid
+network-helper.stop
+STATUS.md
+
+# Binaries, models, environments
+bin/
+models/*
+!models/ru-config.yaml
+!models/ru/
+models/ru/*
+!models/ru/config.yaml
+.venv/
+__pycache__/

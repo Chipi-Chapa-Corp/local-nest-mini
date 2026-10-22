@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Local Nest Mini</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M3 21c0-7 5.8-12 13-12s13 5 13 12c0 1.7-1.3 3-3 3H6c-1.7 0-3-1.3-3-3z' fill='%23d9dbe3'/%3E%3C/svg%3E">
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#0f1117;--card:rgba(255,255,255,.04);--card-line:rgba(255,255,255,.08);
+  --text:#e9ebf3;--muted:#9097ab;--faint:#5d6378;
+  --a1:#8b7cf6;--a2:#5fa8f5;--ok:#5fd4a0;--bad:#f27a8a;
+  --grad:linear-gradient(135deg,var(--a1),var(--a2));
+}
+@media (prefers-color-scheme:light){:root{
+  color-scheme:light;
+  --bg:#f6f6fb;--card:rgba(255,255,255,.75);--card-line:rgba(30,30,60,.08);
+  --text:#1e2030;--muted:#6b7086;--faint:#a5a9bb;
+}}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;color:var(--text);font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  background:radial-gradient(900px 500px at 10% -10%,rgba(139,124,246,.16),transparent 60%),
+             radial-gradient(800px 500px at 100% 0%,rgba(95,168,245,.12),transparent 60%),var(--bg)}
+header{position:sticky;top:0;z-index:2;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;
+  padding:14px 28px;backdrop-filter:blur(14px);background:color-mix(in srgb,var(--bg) 70%,transparent);border-bottom:1px solid var(--card-line)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:17px}
+.brand svg{width:34px;height:34px}
+.status{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:14px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--faint)}
+.live .dot{background:var(--ok);box-shadow:0 0 0 4px rgba(95,212,160,.15);animation:breathe 2.4s ease-in-out infinite}
+.live{color:var(--text)}.down .dot{background:var(--bad)}
+.actions{display:flex;justify-content:flex-end;gap:6px}
+.icon{width:36px;height:36px;display:grid;place-items:center;border-radius:10px;border:1px solid transparent;background:transparent;color:var(--muted);cursor:pointer}
+.icon:hover{background:var(--card);border-color:var(--card-line);color:var(--text)}
+.icon svg{width:18px;height:18px}
+main{max-width:1180px;margin:0 auto;padding:28px 28px 64px}
+h2{font-size:15px;font-weight:600;color:var(--muted);margin:0 0 14px}
+section+section{margin-top:36px}
+.card{background:var(--card);border:1px solid var(--card-line);border-radius:18px;backdrop-filter:blur(8px)}
+.empty{color:var(--muted);padding:22px}
+.task{padding:18px 22px;margin-bottom:12px}
+.task-top{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:13.5px;margin-bottom:14px}
+.flow{display:flex;align-items:flex-start}
+.step{flex:1 1 0;min-width:0;display:flex;align-items:flex-start;gap:10px}
+.step:last-child{flex:1.1 1 0}
+.node{flex:none;width:38px;height:38px;border-radius:50%;display:grid;place-items:center;position:relative;
+  border:1.5px solid var(--card-line);color:var(--faint);background:var(--bg)}
+.node svg{width:18px;height:18px}
+.done .node{border-color:transparent;background:var(--grad);color:#fff;box-shadow:0 6px 18px -6px rgba(124,124,246,.6)}
+.loading .node{color:var(--a1);border-color:var(--a1)}
+.loading .node::after{content:"";position:absolute;inset:-5px;border-radius:50%;border:2px solid transparent;border-top-color:var(--a2);animation:spin 1s linear infinite}
+.error .node{border-color:var(--bad);color:var(--bad);background:rgba(242,122,138,.1)}
+.label{min-width:0;padding-top:8px;font-size:14px;color:var(--text);overflow-wrap:anywhere}
+.pending .label,.skipped .label{color:var(--faint)}.error .label{color:var(--bad)}
+.label q{color:var(--muted)}.label q::before,.label q::after{content:'"'}
+.line{flex:1 1 16px;min-width:16px;height:2px;margin:18px 6px 0 2px;border-radius:2px;background:var(--card-line)}
+.done .line{background:var(--grad);opacity:.7}
+.err{margin-top:14px;padding:10px 14px;border-radius:12px;background:rgba(242,122,138,.1);color:var(--bad);font-size:14px;overflow-wrap:anywhere}
+.more{display:block;margin:4px auto 0;padding:8px 16px;border-radius:10px;border:1px solid var(--card-line);background:var(--card);color:var(--muted);font:inherit;font-size:14px;cursor:pointer}
+.more:hover{color:var(--text)}
+details{border-bottom:1px solid var(--card-line)}details:last-child{border-bottom:0}
+summary{list-style:none;display:flex;gap:12px;align-items:baseline;padding:12px 20px;cursor:pointer}
+summary::-webkit-details-marker{display:none}
+summary:hover{background:var(--card)}
+.what{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.count{color:var(--muted);font-size:13px}
+.when{color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums}
+details[open] .what{white-space:normal}
+pre{margin:0;padding:4px 20px 16px;color:var(--muted);font:12.5px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes breathe{50%{box-shadow:0 0 0 7px rgba(95,212,160,0)}}
+@media (max-width:860px){
+  header{padding:12px 16px}main{padding:20px 16px 48px}
+  .flow{flex-direction:column;gap:6px}.step,.step:last-child{flex:none;width:100%}.line{display:none}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg viewBox="0 0 32 32" aria-hidden="true">
+      <defs><linearGradient id="fabric" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#eceef4"/><stop offset="1" stop-color="#b6bac7"/></linearGradient></defs>
+      <path d="M3 21c0-7 5.8-12 13-12s13 5 13 12c0 1.7-1.3 3-3 3H6c-1.7 0-3-1.3-3-3z" fill="url(#fabric)"/>
+      <circle cx="11.5" cy="15.5" r="1.4" fill="#5fa8f5"/><circle cx="14.5" cy="15.5" r="1.4" fill="#f27a8a"/>
+      <circle cx="17.5" cy="15.5" r="1.4" fill="#f5c46b"/><circle cx="20.5" cy="15.5" r="1.4" fill="#5fd4a0"/>
+    </svg>
+    Local Nest Mini
+  </div>
+  <div class="status" id="status"><span class="dot"></span><span id="status-text">Connecting</span></div>
+  <div class="actions">
+    <button class="icon" id="pause" title="Pause"></button>
+    <button class="icon" id="refresh" title="Refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg></button>
+  </div>
+</header>
+<main>
+  <section><h2>Pipelines</h2><div id="tasks"></div></section>
+  <section><h2>Recent requests</h2><div id="requests" class="card"></div></section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const S='viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
+const ICON={
+  speaker:`<svg ${S}><path d="M3 16a9 9 0 0 1 18 0v.5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 16.5z"/><path d="M9 13h.01M12 13h.01M15 13h.01"/></svg>`,
+  text:`<svg ${S}><path d="M4 6h16M4 12h10M4 18h13"/></svg>`,
+  spark:`<svg ${S}><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 16l.7 1.8 1.8.7-1.8.7L19 21l-.7-1.8-1.8-.7 1.8-.7z"/></svg>`,
+  wave:`<svg ${S}><path d="M4 10v4M8 7v10M12 4v16M16 8v8M20 11v2"/></svg>`,
+  pause:`<svg ${S}><path d="M9 5v14M15 5v14"/></svg>`,
+  play:`<svg ${S}><path d="M7 5l12 7-12 7z"/></svg>`,
+  stop:`<svg ${S}><rect x="6" y="6" width="12" height="12" rx="2"/></svg>`,
+};
+const LANG={en:"English",ru:"Russian"};
+const state={paused:false,showAll:false,open:new Set(),last:{}};
+
+function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+function q(text){const t=String(text??""),s=t.length>70?t.slice(0,68).trimEnd()+"…":t;return `<q title="${esc(t)}">${esc(s)}</q>`}
+function clock(ts){return new Date(ts*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"})}
+function secs(a,b){return a&&b?`${(b-a).toFixed(1)} s`:""}
+
+function steps(task){
+  const by=Object.fromEntries((task.stages||[]).map(s=>[s.name,s]));
+  const finished=task.status!=="loading";
+  const d=name=>(by[name]&&by[name].detail)||{};
+  const tr=d("transcribe"),pr=d("process"),out=d("output");
+  const defs=[
+    ["received","speaker","Received input from Nest","Receiving input from Nest…","Waiting for Nest"],
+    ["transcribe","text",tr.text?`Transcribed input: ${q(tr.text)}`:"Heard nothing","Transcribing…","Transcribe"],
+    ["process","spark",`Generated response: ${q(pr.response)} in language ${q(LANG[pr.lang]||pr.lang||"auto")}`,"Generating response…","Generate response"],
+    ["tts","wave","Converted to audio","Converting to audio…","Convert to audio"],
+    ["output","speaker",out.result?"Closed quietly, nothing to say":"Spoken via Nest","Sending to Nest…","Speak via Nest"],
+  ];
+  return defs.map(([name,icon,done,loading,idle])=>{
+    const st=by[name];
+    let cls=st?st.status:(finished?"skipped":"pending"),label;
+    if(cls==="done")label=done;
+    else if(cls==="loading")label=loading;
+    else if(cls==="error")label=`${esc(idle)} failed`;
+    else if(cls==="interrupted"){cls="error";label="Interrupted";}
+    else label=cls==="skipped"?`${esc(idle)} · skipped`:esc(idle);
+    return {cls,icon,label};
+  });
+}
+
+function renderTasks(tasks){
+  if(!tasks.length){$("tasks").innerHTML='<div class="card empty">No requests from the Nest yet. Say “Hey Google, …”.</div>';return}
+  const shown=state.showAll?tasks:tasks.slice(0,5);
+  $("tasks").innerHTML=shown.map(task=>{
+    const all=steps(task);
+    const flow=all.map((s,i)=>`<div class="step ${s.cls}"><div class="node">${ICON[s.icon]}</div><div class="label">${s.label}</div>${i<all.length-1?'<div class="line"></div>':""}</div>`).join("");
+    const end=task.status==="loading"?"":secs(task.created,task.updated);
+    const stop=task.status==="loading"?`<button class="icon" title="Interrupt" data-stop="${esc(task.id)}">${ICON.stop}</button>`:"";
+    const err=task.error?`<div class="err">${esc(task.error.message)}</div>`:"";
+    return `<article class="card task"><div class="task-top"><span>${clock(task.created)}${end?" · "+end:""}</span>${stop}</div><div class="flow">${flow}</div>${err}</article>`;
+  }).join("")+(tasks.length>5?`<button class="more" id="more">${state.showAll?"Show fewer":`Show all ${tasks.length}`}</button>`:"");
+  document.querySelectorAll("[data-stop]").forEach(b=>b.onclick=()=>fetch(`/api/tasks/${encodeURIComponent(b.dataset.stop)}/interrupt`,{method:"POST"}).then(refresh));
+  if($("more"))$("more").onclick=()=>{state.showAll=!state.showAll;state.last.tasks=null;refresh()};
+}
+
+function describe(e){
+  const kb=n=>`${Math.round(n/1024)} KB`;
+  switch(e.kind){
+    case "local_bootstrap":return "Gave the Nest its local sign-in token";
+    case "local_connectivity":return "Answered the Nest’s internet check";
+    case "upstream_blocked":return `Blocked a Google request to ${e.host}`;
+    case "s3_local_route":return "Nest connected to the voice endpoint";
+    case "s3_control_reply":return e.service==="assistant-settings"?"Synced assistant settings with the Nest":`Answered the Nest’s ${e.service||"control"} request`;
+    case "s3_endpoint":return e.decision==="no_speech"?"Nobody spoke, stopped listening":`You stopped speaking, stopped listening after ${e.audio} s`;
+    case "s3_segments":return e.count?`Captured ${kb(e.bytes)} of audio`:null;
+    case "s3_response":return `Replied ${e.text?`“${e.text}”`:"with audio"}`;
+    case "s3_quiet_close":return "Closed the turn quietly";
+    case "local_wake_only":return "Heard only the wake word";
+    case "local_follow_on_noise":return `Ignored background noise “${e.text}”`;
+    case "s3_query_error":return "Failed to answer: "+String(e.error||"").split("\n")[0];
+    case "s3_send_error":return "Failed to send the reply to the Nest";
+    case "s3_reset":return e.service&&e.service!=="assistant"?"Nest closed a background session":"Nest closed the voice session";
+    case "s3_tls_error":return "A secure connection failed";
+    case "s3_connection_error":return "Voice connection error";
+    case "local_assistant_error":return "Assistant error";
+    default:return e.kind.replace(/_/g," ");
+  }
+}
+
+function renderRequests(events){
+  const groups=[];
+  for(const e of events){
+    const what=describe(e),prev=groups[groups.length-1];
+    if(!what)continue;
+    if(prev&&prev.what===what){prev.count++;continue}
+    groups.push({what,count:1,e,key:e.time+e.kind});
+  }
+  if(!groups.length){$("requests").innerHTML='<div class="empty">Nothing yet.</div>';return}
+  $("requests").innerHTML=groups.map(g=>`<details data-key="${esc(g.key)}"${state.open.has(g.key)?" open":""}><summary><span class="what">${esc(g.what)}</span>${g.count>1?`<span class="count">×${g.count}</span>`:""}<span class="when">${clock(Date.parse(g.e.time)/1000)}</span></summary><pre>${esc(JSON.stringify(g.e,null,2))}</pre></details>`).join("");
+  document.querySelectorAll("details").forEach(el=>el.addEventListener("toggle",()=>el.open?state.open.add(el.dataset.key):state.open.delete(el.dataset.key)));
+}
+
+function setStatus(cls,text){$("status").className="status "+cls;$("status-text").textContent=text}
+
+async function refresh(){
+  try{
+    const [t,r]=await Promise.all([fetch("/api/tasks").then(x=>x.json()),fetch("/api/requests").then(x=>x.json())]);
+    const ts=JSON.stringify(t.tasks),rs=JSON.stringify(r.requests);
+    if(ts!==state.last.tasks){state.last.tasks=ts;renderTasks(t.tasks||[])}
+    if(rs!==state.last.requests){state.last.requests=rs;renderRequests(r.requests||[])}
+    setStatus(state.paused?"":"live",state.paused?"Paused":"Live");
+  }catch{setStatus("down","Disconnected")}
+}
+function setPause(p){state.paused=p;$("pause").innerHTML=p?ICON.play:ICON.pause;$("pause").title=p?"Resume":"Pause";if(!p)refresh();else setStatus("","Paused")}
+$("pause").onclick=()=>setPause(!state.paused);
+$("refresh").onclick=refresh;
+setPause(false);
+setInterval(()=>{if(!state.paused)refresh()},1500);
+</script>
+</body>
+</html>

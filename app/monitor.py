@@ -19,6 +19,7 @@ WANTED = {
     "s3_response", "s3_quiet_close", "local_wake_only", "local_follow_on_noise",
     "s3_query_error", "s3_send_error", "s3_reset", "s3_tls_error", "s3_connection_error",
     "local_assistant_error",
+    "local_cast_asset", "local_cast_error", "task_cancel_error",
 }
 
 
@@ -46,6 +47,8 @@ def _recent_requests(log_path: Path, limit: int = 80, tail: int = 1024 * 1024) -
 
 class MonitorHandler(BaseHTTPRequestHandler):
     store = None
+    test_pipeline = None
+    max_body = 32 * 1024 * 1024
     log_path = Path("data/logs/proxy-events.jsonl")
 
     def _send(self, code: int, body: bytes, content_type: str) -> None:
@@ -67,6 +70,20 @@ class MonitorHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._send(200, PAGE, "text/html; charset=utf-8")
             return
+        if path == "/icons.svg":
+            self._send(200, Path(__file__).with_name("icons.svg").read_bytes(), "image/svg+xml")
+            return
+        if path.startswith("/api/tests/") and path.endswith("/audio"):
+            try:
+                task_id = unquote(path[len("/api/tests/"):-len("/audio")])
+                if self.test_pipeline is None:
+                    self._json(503, {"error": "Test pipelines unavailable"})
+                    return
+                audio = self.test_pipeline.audio(task_id)
+                self._send(200, audio.read_bytes(), "audio/wav")
+            except (ValueError, RuntimeError, OSError) as exc:
+                self._json(404, {"error": str(exc)})
+            return
         if path == "/api/tasks":
             self._json(200, {"tasks": self.store.snapshot()})
             return
@@ -77,6 +94,36 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/tests" or path.startswith("/api/tests/"):
+            try:
+                if self.test_pipeline is None:
+                    self._json(503, {"error": "Test pipelines unavailable"})
+                    return
+                length = int(self.headers.get("content-length", "0"))
+                if length < 0 or length > self.max_body:
+                    self._json(413, {"error": "Recording too large (max 32 MB)"})
+                    self.close_connection = True
+                    return
+                raw = self.rfile.read(length)
+                if path == "/api/tests":
+                    self._json(201, {"task_id": self.test_pipeline.create()})
+                    return
+                parts = path.split("/")
+                if len(parts) != 5:
+                    self._json(404, {"error": "not found"})
+                    return
+                task_id, action = unquote(parts[3]), parts[4]
+                if action == "recording":
+                    self.test_pipeline.receive(task_id, raw)
+                elif action in {"cast", "browser"}:
+                    self.test_pipeline.output(task_id, action)
+                else:
+                    self._json(404, {"error": "not found"})
+                    return
+                self._json(202, {"task_id": task_id})
+            except (ValueError, RuntimeError) as exc:
+                self._json(400, {"error": str(exc)})
+            return
         prefix = "/api/tasks/"
         suffix = "/interrupt"
         if path.startswith(prefix) and path.endswith(suffix):
@@ -90,8 +137,12 @@ class MonitorHandler(BaseHTTPRequestHandler):
         return
 
 
-def start_monitor(store, *, host: str, port: int, log_path: Path) -> ThreadingHTTPServer:
-    handler = type("BoundMonitorHandler", (MonitorHandler,), {"store": store, "log_path": log_path})
+def start_monitor(store, *, host: str, port: int, log_path: Path,
+                  test_pipeline=None, max_body=32 * 1024 * 1024) -> ThreadingHTTPServer:
+    handler = type("BoundMonitorHandler", (MonitorHandler,), {
+        "store": store, "log_path": log_path,
+        "test_pipeline": test_pipeline, "max_body": max_body,
+    })
     server = ThreadingHTTPServer((host, port), handler)
     thread = threading.Thread(target=server.serve_forever, name="task-monitor", daemon=True)
     thread.start()

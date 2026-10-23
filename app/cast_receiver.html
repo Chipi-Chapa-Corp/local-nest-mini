@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Local Nest audio</title></head>
+<body>
+<audio id="player" autoplay></audio>
+<script src="/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+<script>
+// These are plain local WAV files; adaptive streaming libraries are unnecessary.
+const context = cast.framework.CastReceiverContext.getInstance();
+context.start({
+  mediaElement: document.getElementById('player'),
+  skipPlayersLoad: true,
+  disableIdleTimeout: true
+});
+</script>
+</body>
+</html>

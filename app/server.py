@@ -15,9 +15,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .monitor import start_monitor
+from .kitten_tts import REVISION as KITTEN_REVISION
 from .player import PLAYER
 from .processor import respond
 from .tasks import TASKS, TaskCancelled
+from .test_pipeline import TestPipeline
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 TTS_DIR = Path(os.environ.get("TTS_DIR", str(DATA_DIR / "tts")))
@@ -26,6 +28,19 @@ TTS_DIR.mkdir(parents=True, exist_ok=True)
 STT_MODEL = Path(os.environ.get("STT_MODEL", "/app/models/stt/futo.bin"))
 WHISPER_BIN = Path(os.environ.get("WHISPER_BIN", "/usr/local/bin/whisper-cli"))
 POCKET_BIN = Path(os.environ.get("POCKET_BIN", "/usr/local/bin/pocket-tts"))
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+TTS_BACKEND = os.environ.get("TTS_BACKEND", "pocket").lower()
+KITTEN_PYTHON = Path(os.environ.get("KITTEN_PYTHON", str(PROJECT_DIR / "models/kitten-env/bin/python")))
+KITTEN_CACHE = Path(os.environ.get("KITTEN_CACHE", str(PROJECT_DIR / "models/kitten-tts-2")))
+KITTEN_MINI_PYTHON = Path(os.environ.get("KITTEN_MINI_PYTHON", str(PROJECT_DIR / "models/kitten-mini-env/bin/python")))
+KITTEN_MINI_DIR = Path(os.environ.get("KITTEN_MINI_DIR", str(PROJECT_DIR / "models/kitten-tts-mini-0.8")))
+KITTEN_DECODER = os.environ.get("KITTEN_DECODER", "default")
+KITTEN_THREADS = int(os.environ.get("KITTEN_THREADS", "6"))
+KITTEN_DECODER_THREADS = int(os.environ.get("KITTEN_DECODER_THREADS", "2"))
+KITTEN_VOICE_EN = os.environ.get("KITTEN_VOICE_EN", "Bruno")
+KITTEN_VOICE_RU = os.environ.get("KITTEN_VOICE_RU", "Russian")
+# Keep simultaneous requests from loading several copies inside the service's memory cap.
+KITTEN_LOCK = threading.Lock()
 RU_CONFIG = Path(os.environ.get("RU_CONFIG", "/app/models/ru/config.yaml"))
 RU_VOICE = Path(os.environ.get("RU_VOICE", "/app/models/voices/ru.safetensors"))
 PC_IP = os.environ.get("PC_IP", "127.0.0.1")
@@ -61,6 +76,7 @@ def _stop_process(proc) -> None:
 
 
 def _run(cmd, *, timeout, stdin=None, task_id=None):
+    TASKS.check(task_id)
     argv = [str(part) for part in cmd]
     if not task_id:
         return subprocess.run(
@@ -96,8 +112,14 @@ def _run(cmd, *, timeout, stdin=None, task_id=None):
                 continue
         TASKS.check(task_id)
         return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+    except BaseException:
+        _stop_process(proc)
+        raise
     finally:
         TASKS.unregister_process(task_id, proc)
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None and not pipe.closed:
+                pipe.close()
 
 
 def _audio_duration(path: Path, task_id: str | None = None) -> float:
@@ -157,6 +179,52 @@ def _has_cyrillic(text):
     return any("\u0400" <= char <= "\u04ff" for char in text)
 
 
+def _kitten_ready():
+    if TTS_BACKEND == "kitten-mini":
+        return KITTEN_MINI_PYTHON.is_file() and all((KITTEN_MINI_DIR / name).is_file() for name in (
+            "config.json", "kitten_tts_mini_v0_8.onnx", "voices.npz",
+        ))
+    assets = KITTEN_CACHE / "KittenML/kitten-tts-2" / KITTEN_REVISION
+    return KITTEN_PYTHON.is_file() and all((assets / name).is_file() for name in (
+        "config.json", "cpp/model-tq2_1.gguf", f"cpp/{KITTEN_DECODER}/decoder.pt",
+        f"cpp/{KITTEN_DECODER}/voices.json",
+    ))
+
+
+def _synthesize_kitten(text, lang, output, task_id):
+    if not _kitten_ready():
+        setup = "host/setup-kitten.sh mini" if TTS_BACKEND == "kitten-mini" else "host/setup-kitten.sh"
+        raise RuntimeError(f"KittenTTS environment or cached model missing; run {setup}")
+    if task_id:
+        TASKS.start(task_id, "tts", engine="Kitten TTS Mini 80M" if TTS_BACKEND == "kitten-mini" else "Kitten TTS 2")
+    while not KITTEN_LOCK.acquire(timeout=.2):
+        TASKS.check(task_id)
+    try:
+        TASKS.check(task_id)
+        result = _run([
+            KITTEN_MINI_PYTHON if TTS_BACKEND == "kitten-mini" else KITTEN_PYTHON,
+            Path(__file__).with_name("kitten_tts.py"),
+            "--family", "mini" if TTS_BACKEND == "kitten-mini" else "2",
+            "--cache-dir", KITTEN_MINI_DIR if TTS_BACKEND == "kitten-mini" else KITTEN_CACHE,
+            "--text", text, "--output", output,
+            "--voice", KITTEN_VOICE_RU if lang == "ru" else KITTEN_VOICE_EN,
+            "--decoder", KITTEN_DECODER, "--threads", str(KITTEN_THREADS),
+            "--decoder-threads", str(KITTEN_DECODER_THREADS),
+        ], timeout=180, task_id=task_id)
+        if result.returncode or not output.is_file():
+            detail = result.stderr.decode(errors="replace").strip()[-4000:]
+            raise RuntimeError(detail or "KittenTTS generation failed")
+        report = json.loads(result.stdout.decode().strip().splitlines()[-1])
+        if task_id:
+            TASKS.start(task_id, "tts", metrics=report)
+        return output
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
+    finally:
+        KITTEN_LOCK.release()
+
+
 def synthesize(text: str, lang: str = "en", task_id: str | None = None) -> Path:
     text = text.strip()
     if not text:
@@ -166,7 +234,17 @@ def synthesize(text: str, lang: str = "en", task_id: str | None = None) -> Path:
     lang = (lang or "en").lower()
     if lang == "auto":
         lang = "ru" if _has_cyrillic(text) else "en"
+    if lang not in {"en", "ru"}:
+        raise ValueError("lang must be en or ru")
     output = TTS_DIR / f"reply-{uuid.uuid4().hex}.wav"
+    if TTS_BACKEND == "kitten" or (TTS_BACKEND == "kitten-mini" and lang == "en"):
+        _synthesize_kitten(text, lang, output, task_id)
+        output.chmod(0o644)
+        return output
+    if TTS_BACKEND not in {"pocket", "kitten-mini"}:
+        raise RuntimeError(f"Unknown TTS_BACKEND: {TTS_BACKEND}")
+    if task_id and TTS_BACKEND == "kitten-mini":
+        TASKS.start(task_id, "tts", engine="Pocket TTS")
     if lang == "en":
         cmd = [POCKET_BIN, "generate", "--language", "english_7m_2026-10",
                "--text", text, "--output-path", output, "-q"]
@@ -176,8 +254,6 @@ def synthesize(text: str, lang: str = "en", task_id: str | None = None) -> Path:
         cmd = [POCKET_BIN, "generate", "--config", RU_CONFIG, "--voice", RU_VOICE,
                "--max-tokens", "100", "--quantize", "--text", text,
                "--output-path", output, "-q"]
-    else:
-        raise ValueError("lang must be en or ru")
     result = _run(cmd, timeout=180, task_id=task_id)
     if result.returncode or not output.is_file():
         output.unlink(missing_ok=True)
@@ -287,8 +363,10 @@ class Handler(BaseHTTPRequestHandler):
             checks = {
                 "stt_model": STT_MODEL.is_file(),
                 "whisper": WHISPER_BIN.is_file(),
-                "pocket_tts": POCKET_BIN.is_file(),
-                "russian_tts": RU_CONFIG.is_file() and RU_VOICE.is_file(),
+                "tts": _kitten_ready() if TTS_BACKEND in {"kitten", "kitten-mini"} else POCKET_BIN.is_file(),
+                "tts_backend": TTS_BACKEND,
+                "tts_backend_supported": TTS_BACKEND in {"pocket", "kitten", "kitten-mini"},
+                "russian_tts": _kitten_ready() if TTS_BACKEND == "kitten" else POCKET_BIN.is_file() and RU_CONFIG.is_file() and RU_VOICE.is_file(),
                 "tts_dir": TTS_DIR.is_dir(),
                 "player": OUTPUT_MODE != "cast" or (not PLAYER_ENABLED) or PLAYER.available(),
                 "output_mode": OUTPUT_MODE,
@@ -300,8 +378,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/models":
             self._json(200, {
                 "stt": str(STT_MODEL),
-                "tts_en": "english_7m_2026-10",
-                "tts_ru": str(RU_CONFIG),
+                "tts_backend": TTS_BACKEND,
+                "tts_en": {"kitten": "KittenML/kitten-tts-2", "kitten-mini": "KittenML/kitten-tts-mini-0.8"}.get(TTS_BACKEND, "english_7m_2026-10"),
+                "tts_ru": "KittenML/kitten-tts-2" if TTS_BACKEND == "kitten" else str(RU_CONFIG),
             })
             return
         if path == "/tasks":
@@ -316,6 +395,7 @@ class Handler(BaseHTTPRequestHandler):
             body = audio.read_bytes()
             self.send_response(200)
             self.send_header("content-type", "audio/wav")
+            self.send_header("access-control-allow-origin", "*")
             self.send_header("content-length", str(len(body)))
             self.send_header("cache-control", "no-store")
             self.end_headers()
@@ -338,12 +418,23 @@ class Handler(BaseHTTPRequestHandler):
             raw = self._body()
             data = json.loads(raw or b"{}") if path not in {"/transcribe", "/turn"} else {}
             task_id = _task_id(query, data)
+            if path == "/task/cancel":
+                if not task_id:
+                    raise ValueError("task_id is required")
+                # Remember cancellation even if the S3 worker is still waiting
+                # for its model lock and has not sent /task/start yet.
+                if not TASKS.exists(task_id):
+                    TASKS.create(task_id, source="nest")
+                TASKS.cancel(task_id)
+                self._json(200, {"task_id": task_id, "interrupted": True})
+                return
             if path == "/task/start":
                 meta = dict(data)
                 meta.pop("task_id", None)
                 created = meta.pop("received", None)
                 task_id = _ensure_task(task_id, created=created, source="nest", **meta)
                 TASKS.finish(task_id, "received", **meta)
+                TASKS.check(task_id)
                 self._json(200, {"task_id": task_id})
                 return
             if path == "/task/output":
@@ -458,7 +549,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     if MONITOR_ENABLED:
-        monitor = start_monitor(TASKS, host=MONITOR_HOST, port=MONITOR_PORT, log_path=LOG_PATH)
+        tests = TestPipeline(TASKS, transcribe=transcribe_audio, respond=respond,
+                             synthesize=synthesize, urls=tts_urls, player=PLAYER, data_dir=DATA_DIR)
+        monitor = start_monitor(TASKS, host=MONITOR_HOST, port=MONITOR_PORT,
+                                log_path=LOG_PATH, test_pipeline=tests, max_body=MAX_BODY)
         print(f"monitor listening on {MONITOR_HOST}:{monitor.server_port}", flush=True)
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     if OUTPUT_MODE == "cast" and PLAYER_ENABLED and PLAYER.available():

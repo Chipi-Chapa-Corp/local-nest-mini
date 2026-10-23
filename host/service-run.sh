@@ -39,6 +39,7 @@ export PROXY_CONFIG="$PROJECT_DIR/proxy-config"
 export STT_MODEL="$PROJECT_DIR/models/stt/futo.bin"
 export WHISPER_BIN="$PROJECT_DIR/bin/whisper-cli"
 export POCKET_BIN="$PROJECT_DIR/bin/pocket-tts"
+export TTS_BACKEND="${TTS_BACKEND:-pocket}"
 export RU_CONFIG="$PROJECT_DIR/models/ru/config.yaml"
 export RU_VOICE="$PROJECT_DIR/models/ru/voice.safetensors"
 export LISTEN_HOST=0.0.0.0
@@ -87,7 +88,10 @@ trap cleanup EXIT INT TERM
 
 if [[ "$ASSISTANT_ENABLED" == 1 ]]; then
   [[ -x .venv/bin/python ]] || { echo "missing .venv/bin/python; run host/setup-host.sh" >&2; exit 1; }
-  [[ -x "$WHISPER_BIN" && -x "$POCKET_BIN" ]] || { echo "missing STT/TTS binaries" >&2; exit 1; }
+  [[ -x "$WHISPER_BIN" ]] || { echo "missing Whisper binary" >&2; exit 1; }
+  if [[ "$TTS_BACKEND" == pocket ]]; then
+    [[ -x "$POCKET_BIN" ]] || { echo "missing Pocket TTS binary" >&2; exit 1; }
+  fi
   [[ -s "$STT_MODEL" ]] || { echo "missing STT model: $STT_MODEL" >&2; exit 1; }
   "$WHISPER_BIN" --help >/dev/null 2>&1 || {
     echo "Whisper cannot start; check its shared-library dependencies" >&2; exit 1;

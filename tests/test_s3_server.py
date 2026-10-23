@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -114,6 +115,69 @@ class S3TransportTest(unittest.IsolatedAsyncioTestCase):
             body, trailers = await self.read_response()
         self.assertEqual(body, b"")
         self.assertEqual(trailers[b"grpc-status"], b"13")
+
+    async def test_heartbeats_continue_during_model_work(self):
+        initial = _field(1, b"assistant") + _field(29735924, _field(1, 250))
+        audio = _frame(_field(293101, _field(1, b"fLaC" + bytes(16))))
+        gate = threading.Event()
+        def generate(*args):
+            gate.wait(2)
+            return "test", b"native-reply", {}
+        try:
+            with patch.object(s3_server, "_run_query", side_effect=generate):
+                self.client.send_data(1, _frame(initial) + audio + _frame(_field(3, 1)))
+                self.writer.write(self.client.data_to_send())
+                await asyncio.sleep(.6)
+                gate.set()
+                body, trailers = await self.read_response()
+            fields = [f for frame in _frames(body[:-len(b"native-reply")]) for f, w, v in _fields(frame)]
+            self.assertGreaterEqual(fields.count(29737259), 2)
+            self.assertEqual(trailers[b"grpc-status"], b"0")
+        finally:
+            gate.set()
+
+    async def test_reset_cancels_assistant_worker(self):
+        entered, release, cancelled = threading.Event(), threading.Event(), threading.Event()
+        def generate(*args):
+            entered.set()
+            release.wait(2)
+            return "test", b"reply", {}
+        request = _frame(_field(293101, _field(1, b"fLaC" + bytes(16))))
+        try:
+            with patch.object(s3_server, "_run_query", side_effect=generate), \
+                 patch.object(s3_server, "_cancel_query", side_effect=lambda task_id: cancelled.set()) as cancel:
+                self.client.send_data(1, request, end_stream=True)
+                self.writer.write(self.client.data_to_send())
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                self.client.reset_stream(1, error_code=8)
+                self.writer.write(self.client.data_to_send())
+                self.assertTrue(await asyncio.to_thread(cancelled.wait, 1))
+                cancel.assert_called_once()
+                self.assertEqual(len(cancel.call_args.args[0]), 32)
+        finally:
+            release.set()
+
+    async def test_disconnect_after_delivery_does_not_cancel_success(self):
+        request = _frame(_field(293101, _field(1, b"fLaC" + bytes(16))))
+        updating, release = threading.Event(), threading.Event()
+        def finish(*args):
+            updating.set()
+            release.wait(2)
+        try:
+            with patch.object(s3_server, "_run_query", return_value=("test", b"reply", {})), \
+                 patch.object(s3_server, "_finish_output", side_effect=finish), \
+                 patch.object(s3_server, "_cancel_query") as cancel:
+                self.client.send_data(1, request, end_stream=True)
+                self.writer.write(self.client.data_to_send())
+                body, trailers = await self.read_response()
+                self.assertEqual(body, b"reply")
+                self.assertTrue(await asyncio.to_thread(updating.wait, 1))
+                self.writer.close()
+                await self.writer.wait_closed()
+                await asyncio.sleep(.05)
+                cancel.assert_not_called()
+        finally:
+            release.set()
 
     async def test_client_waits_for_s3_heartbeat_before_audio(self):
         initial = _field(1, b"assistant") + _field(29735924, _field(1, 1000))

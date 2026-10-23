@@ -67,6 +67,8 @@ class TaskStore:
             task["status"] = "interrupted"
         elif any(stage["status"] == "loading" for stage in task["stages"]):
             task["status"] = "loading"
+        elif any(stage["status"] == "waiting" for stage in task["stages"]):
+            task["status"] = "waiting"
         else:
             task["status"] = "done"
         task["updated"] = now()
@@ -85,6 +87,8 @@ class TaskStore:
             task = self._task(task_id)
             stage = next((item for item in task["stages"] if item["name"] == name), None)
             stamp = now()
+            if task["interrupt_requested"] and status in {"loading", "waiting", "done"}:
+                status = "interrupted"
             if stage is None:
                 stage = {"name": name, "status": status, "started": stamp, "ended": None, "detail": {}}
                 task["stages"].append(stage)
@@ -114,7 +118,7 @@ class TaskStore:
             event.set()
             task["interrupt_requested"] = True
             for stage in task["stages"]:
-                if stage["status"] == "loading":
+                if stage["status"] in {"loading", "waiting"}:
                     stage["status"] = "interrupted"
                     stage["ended"] = now()
             self._recompute(task)

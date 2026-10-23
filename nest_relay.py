@@ -40,6 +40,22 @@ ALLOW_GOOGLE_UPSTREAM = os.environ.get('ALLOW_GOOGLE_UPSTREAM', '0') == '1'
 S3_SERVER_PORT = int(os.environ.get('S3_SERVER_PORT', '18444'))
 OFFLINE_BOOTSTRAP_ENABLED = os.environ.get('OFFLINE_BOOTSTRAP_ENABLED', '1') == '1'
 NATIVE_TEMPLATE = Path(os.environ.get('NATIVE_TEMPLATE', str(DATA_DIR / 'native-template.bin')))
+CAST_ASSETS = {
+    '/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js': 'cast_receiver_framework.js',
+    '/external_hosted/cast_3p/js_libs/prod/castlite_js_lib.js': 'castlite_js_lib.js',
+    '/external_hosted/cast_3p/js_libs/prod/sizzle.js': 'sizzle.js',
+}
+
+
+def local_asset(host, path, data_dir):
+    # Exact local routes only; all other Google requests remain blocked.
+    if host != 'www.gstatic.com':
+        return None
+    if path == '/cast/sdk/default_receiver/1.0/app.html':
+        return Path(__file__).parent / 'app/cast_receiver.html', 'text/html; charset=utf-8'
+    if path in CAST_ASSETS:
+        return Path(data_dir) / 'cast' / CAST_ASSETS[path], 'text/javascript'
+    return None
 
 
 def _has_cyrillic(text):
@@ -159,7 +175,8 @@ class NestRelay:
             if audio.is_file() and audio.suffix.lower() in ('.wav', '.mp3', '.ogg'):
                 data = audio.read_bytes()
                 ctype = {'.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg'}[audio.suffix.lower()]
-                headers = {'content-type': ctype, 'accept-ranges': 'bytes', 'cache-control': 'no-store'}
+                headers = {'content-type': ctype, 'accept-ranges': 'bytes', 'cache-control': 'no-store',
+                           'access-control-allow-origin': '*'}
                 status, body = 200, data
                 rng = flow.request.headers.get('range', '')
                 if rng.startswith('bytes='):
@@ -190,7 +207,20 @@ class NestRelay:
         host = flow.request.host.lower().rstrip('.')
         path = flow.request.path.split('?', 1)[0]
         if not ALLOW_GOOGLE_UPSTREAM:
-            if host in {'connectivitycheck.gstatic.com', 'clients1.google.com'} and path == '/generate_204':
+            asset = local_asset(host, path, DATA_DIR)
+            if asset:
+                file, content_type = asset
+                try:
+                    body = file.read_bytes()
+                except OSError:
+                    flow.response = http.Response.make(503, b'Local Cast SDK missing; run host/setup-cast.sh\n')
+                    log('local_cast_error', host=host, path=path, error='asset missing')
+                else:
+                    flow.response = http.Response.make(200, body, {
+                        'content-type': content_type, 'cache-control': 'no-store',
+                        'access-control-allow-origin': '*', 'alt-svc': 'clear'})
+                    log('local_cast_asset', host=host, path=path, bytes=len(body))
+            elif host in {'connectivitycheck.gstatic.com', 'clients1.google.com'} and path == '/generate_204':
                 flow.response = http.Response.make(204, b'', {'alt-svc': 'clear'})
                 log('local_connectivity', host=host, path=path)
             elif OFFLINE_BOOTSTRAP_ENABLED and host == 'clients3.google.com' and path == '/cast/orchestration/googleoauthtoken':

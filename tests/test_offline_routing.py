@@ -62,6 +62,28 @@ class OfflineRoutingTest(unittest.TestCase):
             self.assertEqual(flow.response.status_code, 204)
             self.assertEqual(flow.response.content, b"")
 
+    def test_cast_receiver_and_cached_sdk_are_served_without_upstream(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(nest_relay, "DATA_DIR", directory):
+            from pathlib import Path
+            sdk = Path(directory) / "cast" / "cast_receiver_framework.js"
+            sdk.parent.mkdir()
+            sdk.write_bytes(b"cached sdk")
+            flow = self.request("www.gstatic.com", "/cast/sdk/default_receiver/1.0/app.html")
+            self.assertEqual(flow.response.status_code, 200)
+            self.assertIn(b"skipPlayersLoad: true", flow.response.content)
+            path = "/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"
+            flow = self.request("www.gstatic.com", path)
+            self.assertEqual(flow.response.content, b"cached sdk")
+            self.assertEqual(flow.response.status_code, 200)
+            # Exact routes only: no arbitrary cache files or other hosts.
+            self.assertEqual(self.request("other.gstatic.com", path).response.status_code, 503)
+            self.assertEqual(self.request("www.gstatic.com", path + "/../secret").response.status_code, 503)
+            sdk.unlink()
+            flow = self.request("www.gstatic.com", path)
+            self.assertEqual(flow.response.status_code, 503)
+            self.assertIn(b"setup-cast.sh", flow.response.content)
+
     def test_bootstrap_is_local_and_uses_nested_credentials(self):
         from app.bootstrap import token_response
         path = "/cast/orchestration/googleoauthtoken"

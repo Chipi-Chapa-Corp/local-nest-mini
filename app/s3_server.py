@@ -245,6 +245,14 @@ def _finish_output(task_id, size, error=None, **extra):
         log("task_output_error", task_id=task_id, error=f"{type(exc).__name__}: {exc}")
 
 
+def _cancel_query(task_id):
+    try:
+        _assistant("/task/cancel", json.dumps({"task_id": task_id}).encode(),
+                   "application/json")
+    except Exception as exc:
+        log("task_cancel_error", task_id=task_id, error=f"{type(exc).__name__}: {exc}")
+
+
 class Stream:
     def __init__(self, stream_id, headers, started):
         self.stream_id = stream_id
@@ -253,6 +261,9 @@ class Stream:
         self.body = bytearray()
         self.task = None
         self.done = False
+        self.closed = False
+        self.query_started = False
+        self.delivered = False
         self.response_sent = False
         self.debounce_task = None
         self.flow_id = uuid.uuid4().hex
@@ -439,7 +450,9 @@ class Server:
     async def heartbeats(self, conn, writer, state, window, interval):
         """Honor the interval requested in the captured S3 heartbeat extension."""
         try:
-            while not state.done:
+            # The stream remains alive while STT/TTS is running, even after
+            # recording has stopped. The heartbeat is not a recording event.
+            while not state.closed:
                 payload = _field(5, 0) + _field(29737259,
                     _field(1, 0) + _field(2, int(time.time() * 1000)))
                 await self._send_data(conn, writer, state.stream_id, _frame(payload), window)
@@ -468,13 +481,24 @@ class Server:
             log("s3_quiet_close_error", flow=state.flow_id, error=f"{type(exc).__name__}: {exc}")
         log("s3_quiet_close", flow=state.flow_id, reason=reason, bytes=len(reply))
         self._trailers(conn, writer, state.stream_id, 0, "")
+        state.delivered = True
 
     async def respond(self, conn, writer, state, window, no_speech=False):
         if state.done:
             return
         state.done = True
-        if state.heartbeat_task:
-            state.heartbeat_task.cancel()
+        try:
+            await self._respond(conn, writer, state, window, no_speech)
+        except asyncio.CancelledError:
+            if state.query_started and not state.delivered:
+                await asyncio.to_thread(_cancel_query, state.flow_id)
+            raise
+        finally:
+            state.closed = True
+            if state.heartbeat_task:
+                state.heartbeat_task.cancel()
+
+    async def _respond(self, conn, writer, state, window, no_speech):
         body = bytes(state.body)
         if no_speech:
             await self.quiet_close(conn, writer, state, window, "no speech")
@@ -500,6 +524,7 @@ class Server:
         capture.write_bytes(body)
         try:
             async with self.model_lock:
+                state.query_started = True
                 result = await asyncio.to_thread(
                     _run_query, audio, state.flow_id, len(body),
                     [len(x) for x in segments], state.started, not has_wake_audio(body),
@@ -519,6 +544,7 @@ class Server:
             conn.send_headers(state.stream_id, [("grpc-status", "0")], end_stream=True)
             writer.write(conn.data_to_send())
             await writer.drain()
+            state.delivered = True
             log("s3_response", flow=task_id, bytes=len(native),
                 text=answer.get("response", ""), audio_url=answer.get("audio_url", ""))
             await asyncio.to_thread(_finish_output, task_id, len(native))

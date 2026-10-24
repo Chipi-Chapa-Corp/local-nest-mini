@@ -176,7 +176,7 @@ def _assistant(path, body, content_type, task_id=None):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=300) as response:
             return json.loads(response.read() or b"{}")
     except urllib.error.HTTPError as exc:
         detail = json.loads(exc.read(16384) or b"{}").get("error", str(exc))

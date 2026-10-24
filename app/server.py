@@ -169,7 +169,7 @@ def transcribe_audio(source: Path, lang: str = "auto", task_id: str | None = Non
         result = _run(
             [WHISPER_BIN, "-m", STT_MODEL, "-l", lang, "-t", STT_THREADS,
              "-nt", "-np", "--audio-ctx", str(audio_ctx), "-f", wav],
-            timeout=180,
+            timeout=300,
             task_id=task_id,
         )
         if result.returncode:
@@ -257,7 +257,7 @@ def _synthesize_kitten(text, lang, output, task_id):
             "--lang", lang,
             "--decoder", KITTEN_DECODER, "--threads", str(KITTEN_THREADS),
             "--decoder-threads", str(KITTEN_DECODER_THREADS),
-        ], timeout=180, task_id=task_id)
+        ], timeout=300, task_id=task_id)
         if result.returncode or not output.is_file():
             detail = result.stderr.decode(errors="replace").strip()[-4000:]
             raise RuntimeError(detail or "KittenTTS generation failed")
@@ -305,7 +305,7 @@ def synthesize(text: str, lang: str = "en", task_id: str | None = None) -> Path:
         cmd = [POCKET_BIN, "generate", "--config", RU_CONFIG, "--voice", RU_VOICE,
                "--max-tokens", "100", "--quantize", "--text", text,
                "--output-path", output, "-q"]
-    result = _run(cmd, timeout=180, task_id=task_id)
+    result = _run(cmd, timeout=300, task_id=task_id)
     if result.returncode or not output.is_file():
         output.unlink(missing_ok=True)
         detail = result.stderr.decode(errors="replace").strip()

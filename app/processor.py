@@ -23,7 +23,7 @@ You are a voice assistant named Laylo [lejlo]. Respond quickly, briefly, and wri
 - Speak as a human would: naturally and realistically.
 """
 
-LLM_TIMEOUT = 60
+LLM_TIMEOUT = 300
 
 
 def respond(text: str) -> str:

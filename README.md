@@ -42,6 +42,12 @@ and the selected playback transport. Each request is a fresh conversation. STT
 and TTS remain local; transcripts go to your configured LLM provider. API failures
 fail the processing stage without generating fallback speech.
 
+LLM and local assistant HTTP requests allow five minutes (300 seconds) per
+request; `/answer` includes both LLM generation and TTS. Whisper, Kitten and
+Pocket inference also allow five minutes. OmniVoice retains its longer internal
+ten-minute limit. S3 heartbeats continue during processing, but these timeouts
+do not override any deadline enforced by the Nest itself.
+
 For offline Cast playback, run `bash host/setup-cast.sh` once to cache the public
 receiver SDK, then restart. The proxy serves a local WAV receiver at the Nest's
 default receiver URL; other Google requests stay blocked. No receiver assets

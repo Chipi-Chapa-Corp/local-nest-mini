@@ -101,7 +101,7 @@ def _assistant(path, body, content_type, task_id=None):
         headers={'content-type': content_type},
         method='POST',
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(request, timeout=300) as response:
         return json.loads(response.read() or b'{}')
 
 

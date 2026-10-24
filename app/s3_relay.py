@@ -309,7 +309,7 @@ class RelayServer:
             await asyncio.wait_for(state.request_done.wait(), 30)
             if not state.local_job:
                 raise RuntimeError("upstream speech response has no captured microphone audio")
-            prepared = await asyncio.wait_for(asyncio.shield(state.local_job), 180)
+            prepared = await asyncio.wait_for(asyncio.shield(state.local_job), 300)
             if not prepared:
                 raise RuntimeError(state.local_error or "no local transcript after removing wake word")
             ogg, answer = prepared

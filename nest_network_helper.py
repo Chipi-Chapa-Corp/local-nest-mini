@@ -24,9 +24,38 @@ import subprocess
 import threading
 import time
 import urllib.request
+from http.client import HTTPException
 from pathlib import Path
 
 STOP = threading.Event()
+
+
+def monitor_nest(nest, expected_mac, connected, record, stop=STOP):
+    """Keep retrying an absent Nest; authorize redirection only for its MAC."""
+    previous = None
+    try:
+        while not stop.is_set():
+            try:
+                with urllib.request.urlopen(
+                        f'http://{nest}:8008/setup/eureka_info', timeout=3) as response:
+                    info = json.load(response)
+                actual_mac = info.get('mac_address', '') if isinstance(info, dict) else ''
+                state = ('connected' if isinstance(actual_mac, str) and
+                         actual_mac.lower() == expected_mac.lower() else 'identity_mismatch')
+            except (OSError, ValueError, HTTPException):
+                state = 'disconnected'
+            if stop.is_set():
+                break
+            if state == 'connected':
+                connected.set()
+            else:
+                connected.clear()
+            if state != previous:
+                record(kind=f'nest_{state}', nest=nest)
+                previous = state
+            stop.wait(5)
+    finally:
+        connected.clear()
 
 
 def checksum(data):
@@ -134,9 +163,6 @@ def main():
     addresses = json.loads(subprocess.check_output([ipcmd, '-j', '-4', 'addr', 'show', 'dev', args.interface]))
     if not any(a['local'] == args.pc for item in addresses for a in item.get('addr_info', [])):
         parser.error('PC address/interface mismatch')
-    info = json.load(urllib.request.urlopen(f'http://{args.nest}:8008/setup/eureka_info', timeout=5))
-    if info.get('mac_address', '').lower() != args.nest_mac.lower():
-        parser.error('Nest identity does not match the device checked in Google Home')
     # Warm up the gateway neighbor entry without any authentication attempt.
     try:
         urllib.request.urlopen(f'http://{args.gateway}/', timeout=3).close()
@@ -165,16 +191,19 @@ def main():
         parser.error('Raw networking is denied even as root. This is commonly a rootless container; run the helper in the host OS terminal, outside the container. No ARP or nft changes have been made.')
     sock.bind((args.interface, 0))
     sock.settimeout(0.3)
+    connected = threading.Event()
+    monitor = threading.Thread(target=monitor_nest,
+                               args=(args.nest, args.nest_mac, connected, record), daemon=True)
 
     class Bridge(socketserver.BaseRequestHandler):
         def handle(self):
-            if self.client_address[0] != args.nest:
+            if self.client_address[0] != args.nest or not connected.is_set():
                 return
             destination = 18445 if self.server.server_address[1] == 443 else 18081
             try:
                 with socket.create_connection(('127.0.0.1', destination), timeout=5) as upstream:
                     self.request.settimeout(5)
-                    while not STOP.is_set():
+                    while not STOP.is_set() and connected.is_set():
                         ready, _, _ = select.select([self.request, upstream], [], [], 0.5)
                         for current in ready:
                             data = current.recv(65536)
@@ -217,8 +246,9 @@ def main():
         applied = True
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda *_: STOP.set())
+        monitor.start()
         limit = 'until stopped' if args.duration == 0 else f'auto-stop after {args.duration}s'
-        print(f'ACTIVE: only {args.nest} / {args.nest_mac}; {limit}. Ctrl-C restores networking.', flush=True)
+        print(f'READY: waiting for {args.nest} / {args.nest_mac}; {limit}. Ctrl-C restores networking.', flush=True)
         if gateway6:
             print(f'IPv6 gateway {gateway6} is redirected for this Nest only; IPv6 WAN is rejected locally.', flush=True)
             record(kind='ipv6_redirect_active', nest=nest6, gateway=gateway6)
@@ -226,9 +256,17 @@ def main():
         deadline = None if args.duration == 0 else time.monotonic() + args.duration
         next_arp = 0
         last_ipv6_reject = 0
+        was_connected = False
         while not STOP.is_set() and (deadline is None or time.monotonic() < deadline):
             if stop_file.exists():
                 break
+            if not connected.is_set():
+                was_connected = False
+                STOP.wait(0.2)
+                continue
+            if not was_connected:
+                next_arp = 0  # Reapply the gateway announcement immediately on reconnect.
+                was_connected = True
             now = time.monotonic()
             if now >= next_arp:
                 sock.send(arp_reply(local_mac, args.gateway, nest_mac, args.nest))
@@ -283,6 +321,8 @@ def main():
                 record(kind='dns', name=name, type=qtype, answer=args.pc if qtype == 1 else 'empty')
     finally:
         STOP.set()
+        if monitor.is_alive():
+            monitor.join(timeout=4)
         if applied:
             subprocess.run([nft, 'delete', 'table', 'ip', table], check=False)
             if gateway6:

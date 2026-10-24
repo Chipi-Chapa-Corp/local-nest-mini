@@ -3,8 +3,12 @@ set -euo pipefail
 PROJECT_DIR="$(cd -- "$(dirname -- "$0")/.." && pwd -P)"
 cd -- "$PROJECT_DIR"
 umask 077
+case "${1:-}" in
+  ''|--check) ;;
+  *) echo "usage: $0 [--check]" >&2; exit 2 ;;
+esac
 
-[[ -f config.env ]] || { echo "missing config.env" >&2; exit 1; }
+[[ -f config.env ]] || { echo "missing config.env; copy config.env.example and configure your network" >&2; exit 1; }
 set -a
 . ./config.env
 if [[ -f .env ]]; then
@@ -17,24 +21,11 @@ done
 : "${SERVICE_DURATION:=0}"
 
 [[ -s proxy-config/mitmproxy-ca.pem ]] || { echo "missing proxy-config/mitmproxy-ca.pem" >&2; exit 1; }
-[[ -x .venv/bin/mitmdump ]] || { echo "missing .venv/bin/mitmdump; run host/setup-host.sh" >&2; exit 1; }
+[[ -x .venv/bin/python ]] || { echo "missing .venv/bin/python; run bash host/setup-host.sh" >&2; exit 1; }
+.venv/bin/python -I -c 'import mitmproxy, pychromecast' || {
+  echo "proxy dependencies unavailable; run bash host/setup-host.sh" >&2; exit 1;
+}
 chmod 600 proxy-config/mitmproxy-ca.pem
-
-for port in 8099 18444 18445 18081 53412; do
-  if timeout 1 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null; then
-    echo "127.0.0.1:$port is already in use; refusing to start" >&2
-    exit 1
-  fi
-done
-
-mkdir -p data/streams data/tts data/logs
-# Keep owned-device captures private but readable by the project owner.
-for capture in data/streams/*-{req,resp}.bin; do
-  [[ -f "$capture" && ! -L "$capture" ]] || continue
-  chown --reference="$PROJECT_DIR" "$capture"
-  chmod 600 "$capture"
-done
-rm -f network-helper.stop
 
 export DATA_DIR="$PROJECT_DIR/data"
 export TTS_DIR="$PROJECT_DIR/data/tts"
@@ -59,38 +50,7 @@ export MONITOR_ENABLED="${MONITOR_ENABLED:-1}"
 export MONITOR_HOST="${MONITOR_HOST:-127.0.0.1}"
 export MONITOR_PORT="${MONITOR_PORT:-53412}"
 
-assistant_pid=""
-proxy_pid=""
-helper_pid=""
-s3_pid=""
-cleanup() {
-  touch network-helper.stop
-  if [[ -n "$s3_pid" ]]; then
-    kill "$s3_pid" 2>/dev/null || true
-    wait "$s3_pid" 2>/dev/null || true
-  fi
-  if [[ -n "$assistant_pid" ]]; then
-    kill "$assistant_pid" 2>/dev/null || true
-    wait "$assistant_pid" 2>/dev/null || true
-  fi
-  if [[ -n "$helper_pid" ]]; then
-    kill "$helper_pid" 2>/dev/null || true
-    wait "$helper_pid" 2>/dev/null || true
-  fi
-  if [[ -n "$proxy_pid" ]]; then
-    kill "$proxy_pid" 2>/dev/null || true
-    for _ in $(seq 1 30); do
-      kill -0 "$proxy_pid" 2>/dev/null || break
-      sleep 0.1
-    done
-    kill -9 "$proxy_pid" 2>/dev/null || true
-    wait "$proxy_pid" 2>/dev/null || true
-  fi
-}
-trap cleanup EXIT INT TERM
-
 if [[ "$ASSISTANT_ENABLED" == 1 ]]; then
-  [[ -x .venv/bin/python ]] || { echo "missing .venv/bin/python; run host/setup-host.sh" >&2; exit 1; }
   [[ -x "$WHISPER_BIN" ]] || { echo "missing Whisper binary" >&2; exit 1; }
   if [[ "$TTS_BACKEND" == pocket ]]; then
     [[ -x "$POCKET_BIN" ]] || { echo "missing Pocket TTS binary" >&2; exit 1; }
@@ -109,6 +69,66 @@ if [[ "$ASSISTANT_ENABLED" == 1 ]]; then
   "$WHISPER_BIN" --help >/dev/null 2>&1 || {
     echo "Whisper cannot start; check its shared-library dependencies" >&2; exit 1;
   }
+  command -v ffmpeg >/dev/null || { echo "missing ffmpeg; install it with your host package manager" >&2; exit 1; }
+  if [[ "$OUTPUT_MODE" == native ]]; then
+    for asset in "$NATIVE_TEMPLATE" "${NATIVE_NOSPEECH_TEMPLATE:-$DATA_DIR/native-nospeech.bin}"; do
+      [[ -s "$asset" ]] || { echo "missing owned-device capture: $asset (see README.md Setup)" >&2; exit 1; }
+    done
+  fi
+fi
+if [[ "${OFFLINE_BOOTSTRAP_ENABLED:-1}" == 1 ]]; then
+  DATA_DIR="$DATA_DIR" .venv/bin/python -c \
+    'import os; from pathlib import Path; from app.bootstrap import load_token_response; load_token_response(Path(os.environ["DATA_DIR"]))' || {
+    echo "missing or invalid data/offline-account-ids.json; supply linked account IDs from your own Nest (see README.md Setup)" >&2
+    exit 1
+  }
+fi
+
+if [[ "${1:-}" == --check ]]; then
+  echo "host runtime prerequisites ready in $PROJECT_DIR"
+  exit
+fi
+
+for port in 8099 18444 18445 18081 53412; do
+  if timeout 1 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+    echo "127.0.0.1:$port is already in use; refusing to start" >&2
+    exit 1
+  fi
+done
+
+mkdir -p data/streams data/tts data/logs
+# Keep owned-device captures private but readable by the project owner.
+for capture in data/streams/*-{req,resp}.bin; do
+  [[ -f "$capture" && ! -L "$capture" ]] || continue
+  chown --reference="$PROJECT_DIR" "$capture"
+  chmod 600 "$capture"
+done
+rm -f network-helper.stop
+
+assistant_pid=""
+proxy_pid=""
+helper_pid=""
+s3_pid=""
+cleanup() {
+  touch network-helper.stop
+  for pid in "$s3_pid" "$assistant_pid" "$helper_pid"; do
+    [[ -n "$pid" ]] || continue
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  if [[ -n "$proxy_pid" ]]; then
+    kill "$proxy_pid" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      kill -0 "$proxy_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -9 "$proxy_pid" 2>/dev/null || true
+    wait "$proxy_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+if [[ "$ASSISTANT_ENABLED" == 1 ]]; then
   .venv/bin/python -m app.server &
   assistant_pid=$!
   for _ in $(seq 1 80); do

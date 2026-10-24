@@ -8,9 +8,8 @@ StartLimitBurst=6
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/var/home/kitkat/Projects/IoT/local-nest-mini
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/bash /var/home/kitkat/Projects/IoT/local-nest-mini/host/service-run.sh
+ExecStart=/usr/bin/bash @SERVICE_RUN@
 Restart=on-failure
 RestartSec=10s
 TimeoutStartSec=60s

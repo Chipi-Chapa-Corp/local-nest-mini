@@ -1,5 +1,5 @@
-# Shtorm-PocketTTS-RU fast variant, adapted to local paths for the container.
-weights_path: /var/home/kitkat/Projects/IoT/local-nest-mini/models/ru/model_fast.safetensors
+# Shtorm-PocketTTS-RU fast variant; host service runs from the repository root.
+weights_path: models/ru/model_fast.safetensors
 default_temperature: 0.3
 flow_lm:
   insert_bos_before_voice: true
@@ -17,7 +17,7 @@ flow_lm:
     dim: 1024
     n_bins: 4000
     tokenizer: sentencepiece
-    tokenizer_path: /var/home/kitkat/Projects/IoT/local-nest-mini/models/ru/tokenizer.model
+    tokenizer_path: models/ru/tokenizer.model
 mimi:
   dtype: float32
   sample_rate: 24000

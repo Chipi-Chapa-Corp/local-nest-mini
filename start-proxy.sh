@@ -7,13 +7,13 @@ export DATA_DIR PROXY_CONFIG
 umask 077
 mkdir -p "$DATA_DIR/streams" "$DATA_DIR/tts" "$DATA_DIR/logs"
 
-if [[ -x "$SCRIPT_DIR/.venv/bin/mitmdump" ]]; then
-  MITMDUMP="$SCRIPT_DIR/.venv/bin/mitmdump"
+if [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
+  PYTHON="$SCRIPT_DIR/.venv/bin/python"
 else
-  MITMDUMP="$(command -v mitmdump)"
+  PYTHON="$(command -v python3)"
 fi
 
-exec "$MITMDUMP" \
+exec "$PYTHON" -c 'from mitmproxy.tools.main import mitmdump; mitmdump()' \
   --mode 'reverse:https://placeholder.invalid@127.0.0.1:18445' \
   --mode 'reverse:http://placeholder.invalid@127.0.0.1:18081' \
   --set "confdir=$PROXY_CONFIG" \

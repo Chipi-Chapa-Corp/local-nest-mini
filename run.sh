@@ -19,7 +19,10 @@ case "$action" in
     ;;
 esac
 
-[[ -f config.env ]] || { echo "missing config.env" >&2; exit 1; }
+if [[ "$action" == install && ! -f config.env ]]; then
+  echo "missing config.env; copy config.env.example and configure your network (see README.md Setup)" >&2
+  exit 1
+fi
 
 host=()
 where="host"
@@ -63,7 +66,7 @@ show_logs() {
 case "$action" in
   install)
     echo "installing and starting $SERVICE on $where"
-    run_sudo "$PROJECT_DIR/host/install-service.sh"
+    run_sudo bash "$PROJECT_DIR/host/install-service.sh"
     echo
     echo "service status:"
     show_status
@@ -94,6 +97,6 @@ case "$action" in
     show_logs
     ;;
   uninstall)
-    run_sudo "$PROJECT_DIR/host/uninstall-service.sh"
+    run_sudo bash "$PROJECT_DIR/host/uninstall-service.sh"
     ;;
 esac

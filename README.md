@@ -29,6 +29,26 @@ app/server.py               Whisper STT → app/processor.py → TTS
 3. `./run.sh` installs and starts the systemd service (needs sudo).
 4. Replug the Nest.
 
+The host needs Bash, Python 3 with `venv`/pip, ffmpeg, and systemd. Install
+dependencies and generate the proxy CA with `bash host/setup-host.sh` (also run
+automatically by `./run.sh install`). Models, binaries, credentials, certificates,
+and owned-device captures are private local assets and are ignored by git;
+they are not shipped with this repository. Complete steps 1–2 on a new checkout.
+Installation checks the runtime prerequisites before replacing the service unit.
+
+After moving the folder on the same host, run `./run.sh install` from its new
+location. Installation renders the systemd paths from that checkout and repairs
+the OmniVoice source link. Python tools run through their interpreter so moved
+virtual environments do not rely on old console-script paths. The tracked unit
+is a template; install it through `run.sh`. A different machine or Python version
+may require recreating the ignored Python environments and rerunning setup.
+`bash host/service-run.sh --check` checks prerequisites without starting services.
+
+The Nest can be offline when the service starts. The helper checks its configured
+IP and MAC every five seconds, waits through disconnects, and reapplies network
+redirection when it reconnects. The assistant and proxy stay running. A different
+device at that IP is not redirected; update `NEST_IP` if the Nest's address changes.
+
 `./run.sh restart|stop|logs|uninstall` · tasks: http://127.0.0.1:53412 · tests: `.venv/bin/python -m unittest discover -s tests`
 
 The monitor’s **Test** button creates a browser test pipeline. Click the microphone

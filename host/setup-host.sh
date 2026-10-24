@@ -3,12 +3,19 @@ set -euo pipefail
 PROJECT_DIR="$(cd -- "$(dirname -- "$0")/.." && pwd -P)"
 cd -- "$PROJECT_DIR"
 
-if [[ ! -x .venv/bin/mitmdump ]]; then
+if ! .venv/bin/python -c 'import sys' >/dev/null 2>&1; then
   python3 -m venv .venv
 fi
-if ! .venv/bin/python -c 'import mitmproxy, pychromecast' >/dev/null 2>&1; then
-  .venv/bin/pip install --upgrade pip
-  .venv/bin/pip install -r requirements.txt
+if ! .venv/bin/python -I -c 'import mitmproxy, pychromecast' >/dev/null 2>&1; then
+  # Console scripts retain absolute shebangs after moving a venv.
+  .venv/bin/python -m ensurepip --upgrade
+  .venv/bin/python -m pip install --upgrade pip
+  .venv/bin/python -m pip install -r requirements.txt
+fi
+
+# Older installs linked this source using an absolute path in site-packages.
+if [[ -x models/omnivoice-env/bin/python && -d models/omnivoice-src ]]; then
+  models/omnivoice-env/bin/python -I host/link-omnivoice.py
 fi
 
 if [[ ! -s proxy-config/mitmproxy-ca.pem ]]; then

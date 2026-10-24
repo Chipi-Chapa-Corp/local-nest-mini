@@ -14,16 +14,19 @@ set -a
 set +a
 : "${NEST_IP:?missing NEST_IP}"
 
-if ! "$PROJECT_DIR/.venv/bin/python" -c 'import mitmproxy, pychromecast' >/dev/null 2>&1; then
-  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
-    sudo -u "$SUDO_USER" "$PROJECT_DIR/host/setup-host.sh"
-  else
-    "$PROJECT_DIR/host/setup-host.sh"
-  fi
+# Always prepare: imports alone don't detect stale launchers or missing CA files.
+if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
+  sudo -u "$SUDO_USER" bash "$PROJECT_DIR/host/setup-host.sh"
+else
+  bash "$PROJECT_DIR/host/setup-host.sh"
 fi
 
+bash "$PROJECT_DIR/host/service-run.sh" --check
 chmod 600 "$PROJECT_DIR/proxy-config/mitmproxy-ca.pem"
-install -m 0644 "$PROJECT_DIR/host/$SERVICE" "$UNIT"
+rendered_unit="$(mktemp)"
+trap 'rm -f -- "$rendered_unit"' EXIT
+python3 "$PROJECT_DIR/host/render-service.py" > "$rendered_unit"
+install -m 0644 "$rendered_unit" "$UNIT"
 
 if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
   changed=0

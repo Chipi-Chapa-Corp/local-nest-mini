@@ -27,13 +27,12 @@ models/omnivoice-env/bin/python -m pip install --index-url https://download.pyto
   'torch==2.11.0+cpu' 'torchaudio==2.11.0+cpu'
 models/omnivoice-env/bin/python -m pip install 'transformers==5.20.2' accelerate numpy soundfile librosa pydub \
   'audioop-lts; python_version>="3.13"'
+models/omnivoice-env/bin/python -I host/link-omnivoice.py
 models/omnivoice-env/bin/python - <<'PY'
 from pathlib import Path
-import site
 from huggingface_hub import snapshot_download
 from app.omnivoice_tts import MODEL, REVISION
 root = Path.cwd()
-(Path(site.getsitepackages()[0]) / 'omnivoice-source.pth').write_text(str(root/'models/omnivoice-src')+'\n')
 snapshot_download(MODEL, revision=REVISION, local_dir=str(root/'models/omnivoice'),
     allow_patterns=['*.json','*.safetensors','*.txt','LICENSE*','audio_tokenizer/*.json',
                     'audio_tokenizer/*.safetensors','audio_tokenizer/LICENSE*'])

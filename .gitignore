@@ -1,5 +1,6 @@
 # Local config, secrets, runtime output
 config.env
+.env
 proxy-config/
 data/
 *.jsonl

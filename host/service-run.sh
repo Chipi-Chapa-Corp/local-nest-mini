@@ -7,6 +7,9 @@ umask 077
 [[ -f config.env ]] || { echo "missing config.env" >&2; exit 1; }
 set -a
 . ./config.env
+if [[ -f .env ]]; then
+  . ./.env
+fi
 set +a
 for var in NEST_IP NEST_MAC PC_IP GATEWAY INTERFACE; do
   : "${!var:?missing $var in config.env}"
@@ -39,7 +42,7 @@ export PROXY_CONFIG="$PROJECT_DIR/proxy-config"
 export STT_MODEL="$PROJECT_DIR/models/stt/futo.bin"
 export WHISPER_BIN="$PROJECT_DIR/bin/whisper-cli"
 export POCKET_BIN="$PROJECT_DIR/bin/pocket-tts"
-export TTS_BACKEND="${TTS_BACKEND:-pocket}"
+export TTS_BACKEND="${TTS_BACKEND:-omnivoice}"
 export RU_CONFIG="$PROJECT_DIR/models/ru/config.yaml"
 export RU_VOICE="$PROJECT_DIR/models/ru/voice.safetensors"
 export LISTEN_HOST=0.0.0.0
@@ -91,6 +94,16 @@ if [[ "$ASSISTANT_ENABLED" == 1 ]]; then
   [[ -x "$WHISPER_BIN" ]] || { echo "missing Whisper binary" >&2; exit 1; }
   if [[ "$TTS_BACKEND" == pocket ]]; then
     [[ -x "$POCKET_BIN" ]] || { echo "missing Pocket TTS binary" >&2; exit 1; }
+  fi
+  if [[ "$TTS_BACKEND" == omnivoice ]]; then
+    omnivoice_python="${OMNIVOICE_PYTHON:-$PROJECT_DIR/models/omnivoice-env/bin/python}"
+    [[ -x "$omnivoice_python" ]] || {
+      echo "missing OmniVoice environment; run bash host/setup-omnivoice.sh" >&2; exit 1;
+    }
+    if ! "$omnivoice_python" -I -c 'import numpy, torch, torchaudio; from omnivoice import OmniVoice'; then
+      echo "OmniVoice dependencies are missing for the service account; run bash host/setup-omnivoice.sh" >&2
+      exit 1
+    fi
   fi
   [[ -s "$STT_MODEL" ]] || { echo "missing STT model: $STT_MODEL" >&2; exit 1; }
   "$WHISPER_BIN" --help >/dev/null 2>&1 || {

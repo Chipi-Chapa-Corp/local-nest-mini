@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small HTTP service for local transcription, the stub processor, and TTS."""
+"""Small HTTP service for local transcription, LLM replies, and TTS."""
 
 import json
 import math
@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .monitor import start_monitor
 from .kitten_tts import REVISION as KITTEN_REVISION
+from .omnivoice_tts import MODEL as OMNIVOICE_MODEL_NAME
 from .player import PLAYER
 from .processor import respond
 from .tasks import TASKS, TaskCancelled
@@ -29,7 +30,14 @@ STT_MODEL = Path(os.environ.get("STT_MODEL", "/app/models/stt/futo.bin"))
 WHISPER_BIN = Path(os.environ.get("WHISPER_BIN", "/usr/local/bin/whisper-cli"))
 POCKET_BIN = Path(os.environ.get("POCKET_BIN", "/usr/local/bin/pocket-tts"))
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-TTS_BACKEND = os.environ.get("TTS_BACKEND", "pocket").lower()
+TTS_BACKEND = os.environ.get("TTS_BACKEND", "omnivoice").lower()
+OMNIVOICE_PYTHON = Path(os.environ.get("OMNIVOICE_PYTHON", str(PROJECT_DIR / "models/omnivoice-env/bin/python")))
+OMNIVOICE_DIR = Path(os.environ.get("OMNIVOICE_DIR", str(PROJECT_DIR / "models/omnivoice")))
+OMNIVOICE_REFERENCE = Path(os.environ.get("OMNIVOICE_REFERENCE", str(PROJECT_DIR / "models/omnivoice-voices/laylo-en.wav")))
+OMNIVOICE_THREADS = int(os.environ.get("OMNIVOICE_THREADS", "6"))
+OMNIVOICE_STEPS_EN = int(os.environ.get("OMNIVOICE_STEPS_EN", "16"))
+OMNIVOICE_STEPS_RU = int(os.environ.get("OMNIVOICE_STEPS_RU", "32"))
+OMNIVOICE_LOCK = threading.Lock()
 KITTEN_PYTHON = Path(os.environ.get("KITTEN_PYTHON", str(PROJECT_DIR / "models/kitten-env/bin/python")))
 KITTEN_CACHE = Path(os.environ.get("KITTEN_CACHE", str(PROJECT_DIR / "models/kitten-tts-2")))
 KITTEN_MINI_PYTHON = Path(os.environ.get("KITTEN_MINI_PYTHON", str(PROJECT_DIR / "models/kitten-mini-env/bin/python")))
@@ -191,6 +199,44 @@ def _kitten_ready():
     ))
 
 
+def _omnivoice_ready():
+    return OMNIVOICE_PYTHON.is_file() and OMNIVOICE_REFERENCE.is_file() and all(
+        (OMNIVOICE_DIR / name).is_file() for name in (
+            "config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json",
+            "audio_tokenizer/config.json", "audio_tokenizer/model.safetensors",
+            "audio_tokenizer/preprocessor_config.json"))
+
+
+def _synthesize_omnivoice(text, lang, output, task_id):
+    if not _omnivoice_ready():
+        raise RuntimeError("OmniVoice environment, model or voice reference missing; run host/setup-omnivoice.sh")
+    if task_id:
+        TASKS.start(task_id, "tts", engine="OmniVoice CPU")
+    while not OMNIVOICE_LOCK.acquire(timeout=.2):
+        TASKS.check(task_id)
+    try:
+        TASKS.check(task_id)
+        result = _run([
+            OMNIVOICE_PYTHON, Path(__file__).with_name("omnivoice_tts.py"),
+            "--model-dir", OMNIVOICE_DIR, "--reference", OMNIVOICE_REFERENCE,
+            "--text", text, "--output", output, "--lang", lang,
+            "--threads", OMNIVOICE_THREADS,
+            "--steps", OMNIVOICE_STEPS_RU if lang == "ru" else OMNIVOICE_STEPS_EN,
+        ], timeout=600, task_id=task_id)
+        if result.returncode or not output.is_file():
+            detail = result.stderr.decode(errors="replace").strip()[-4000:]
+            raise RuntimeError(detail or "OmniVoice generation failed")
+        report = json.loads(result.stdout.decode().strip().splitlines()[-1])
+        if task_id:
+            TASKS.start(task_id, "tts", metrics=report)
+        return output
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
+    finally:
+        OMNIVOICE_LOCK.release()
+
+
 def _synthesize_kitten(text, lang, output, task_id):
     if not _kitten_ready():
         setup = "host/setup-kitten.sh mini" if TTS_BACKEND == "kitten-mini" else "host/setup-kitten.sh"
@@ -208,6 +254,7 @@ def _synthesize_kitten(text, lang, output, task_id):
             "--cache-dir", KITTEN_MINI_DIR if TTS_BACKEND == "kitten-mini" else KITTEN_CACHE,
             "--text", text, "--output", output,
             "--voice", KITTEN_VOICE_RU if lang == "ru" else KITTEN_VOICE_EN,
+            "--lang", lang,
             "--decoder", KITTEN_DECODER, "--threads", str(KITTEN_THREADS),
             "--decoder-threads", str(KITTEN_DECODER_THREADS),
         ], timeout=180, task_id=task_id)
@@ -237,6 +284,10 @@ def synthesize(text: str, lang: str = "en", task_id: str | None = None) -> Path:
     if lang not in {"en", "ru"}:
         raise ValueError("lang must be en or ru")
     output = TTS_DIR / f"reply-{uuid.uuid4().hex}.wav"
+    if TTS_BACKEND == "omnivoice":
+        _synthesize_omnivoice(text, lang, output, task_id)
+        output.chmod(0o644)
+        return output
     if TTS_BACKEND == "kitten" or (TTS_BACKEND == "kitten-mini" and lang == "en"):
         _synthesize_kitten(text, lang, output, task_id)
         output.chmod(0o644)
@@ -363,10 +414,10 @@ class Handler(BaseHTTPRequestHandler):
             checks = {
                 "stt_model": STT_MODEL.is_file(),
                 "whisper": WHISPER_BIN.is_file(),
-                "tts": _kitten_ready() if TTS_BACKEND in {"kitten", "kitten-mini"} else POCKET_BIN.is_file(),
+                "tts": _omnivoice_ready() if TTS_BACKEND == "omnivoice" else _kitten_ready() if TTS_BACKEND in {"kitten", "kitten-mini"} else POCKET_BIN.is_file(),
                 "tts_backend": TTS_BACKEND,
-                "tts_backend_supported": TTS_BACKEND in {"pocket", "kitten", "kitten-mini"},
-                "russian_tts": _kitten_ready() if TTS_BACKEND == "kitten" else POCKET_BIN.is_file() and RU_CONFIG.is_file() and RU_VOICE.is_file(),
+                "tts_backend_supported": TTS_BACKEND in {"omnivoice", "pocket", "kitten", "kitten-mini"},
+                "russian_tts": _omnivoice_ready() if TTS_BACKEND == "omnivoice" else _kitten_ready() if TTS_BACKEND == "kitten" else POCKET_BIN.is_file() and RU_CONFIG.is_file() and RU_VOICE.is_file(),
                 "tts_dir": TTS_DIR.is_dir(),
                 "player": OUTPUT_MODE != "cast" or (not PLAYER_ENABLED) or PLAYER.available(),
                 "output_mode": OUTPUT_MODE,
@@ -379,8 +430,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {
                 "stt": str(STT_MODEL),
                 "tts_backend": TTS_BACKEND,
-                "tts_en": {"kitten": "KittenML/kitten-tts-2", "kitten-mini": "KittenML/kitten-tts-mini-0.8"}.get(TTS_BACKEND, "english_7m_2026-10"),
-                "tts_ru": "KittenML/kitten-tts-2" if TTS_BACKEND == "kitten" else str(RU_CONFIG),
+                "tts_en": {"omnivoice": OMNIVOICE_MODEL_NAME, "kitten": "KittenML/kitten-tts-2", "kitten-mini": "KittenML/kitten-tts-mini-0.8"}.get(TTS_BACKEND, "english_7m_2026-10"),
+                "tts_ru": OMNIVOICE_MODEL_NAME if TTS_BACKEND == "omnivoice" else "KittenML/kitten-tts-2" if TTS_BACKEND == "kitten" else str(RU_CONFIG),
             })
             return
         if path == "/tasks":
@@ -454,6 +505,7 @@ class Handler(BaseHTTPRequestHandler):
                 stage = "process"
                 TASKS.start(task_id, stage)
                 response = respond(text)
+                TASKS.check(task_id)
                 TASKS.finish(task_id, stage, input=text, response=response)
                 self._json(200, {"input": text, "response": response, "task_id": task_id})
                 return
@@ -474,10 +526,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/answer":
                 task_id = _ensure_task(task_id, source="http")
                 text = str(data.get("text", "")).strip()
-                lang = str(data.get("lang", "en")).lower()
+                lang = str(data.get("lang", "auto")).lower()
                 stage = "process"
                 TASKS.start(task_id, stage, text=text, lang=lang)
                 reply = respond(text)
+                TASKS.check(task_id)
                 TASKS.finish(task_id, stage, response=reply)
                 stage = "tts"
                 TASKS.start(task_id, stage, text=reply, lang=lang)
@@ -511,6 +564,7 @@ class Handler(BaseHTTPRequestHandler):
                 stage = "process"
                 TASKS.start(task_id, stage, text=text)
                 reply = respond(text)
+                TASKS.check(task_id)
                 TASKS.finish(task_id, stage, response=reply)
                 result = {"input": text, "response": reply, "lang": lang, "task_id": task_id}
                 if query.get("speak", ["1"])[0] not in {"0", "false", "no"}:

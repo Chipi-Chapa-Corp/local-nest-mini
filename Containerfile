@@ -42,7 +42,7 @@ ENV PYTHONUNBUFFERED=1 \
     PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg libgomp1 \
+ && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg libgomp1 git \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -83,6 +83,15 @@ RUN mkdir -p /app/.cache/huggingface \
  && rm -f /tmp/ready.wav
 
 COPY app /app/app
+RUN python -m venv /opt/omnivoice \
+ && /opt/omnivoice/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+      'torch==2.11.0+cpu' 'torchaudio==2.11.0+cpu' \
+ && /opt/omnivoice/bin/pip install --no-cache-dir 'transformers==5.20.2' accelerate numpy soundfile librosa pydub \
+ && git init /opt/omnivoice-src \
+ && git -C /opt/omnivoice-src remote add origin https://github.com/k2-fsa/OmniVoice.git \
+ && git -C /opt/omnivoice-src fetch --depth 1 origin 08be0b4ccbac3e13e374e86fbfead4b4cac343e2 \
+ && git -C /opt/omnivoice-src checkout --detach FETCH_HEAD \
+ && /opt/omnivoice/bin/python -c 'import site; from pathlib import Path; (Path(site.getsitepackages()[0]) / "omnivoice-source.pth").write_text("/opt/omnivoice-src\n")'
 COPY nest_relay.py /app/nest_relay.py
 COPY start-proxy.sh /app/start-proxy.sh
 RUN chmod 0755 /app/start-proxy.sh \

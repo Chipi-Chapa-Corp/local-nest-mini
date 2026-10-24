@@ -38,6 +38,18 @@ def _load_mini(args):
         ort.InferenceSession = original
 
 
+def _generate(model, args):
+    if args.family == "mini":
+        model.generate_to_file(args.text, args.output, voice=args.voice)
+    else:
+        lang = args.lang
+        if lang == "auto":
+            lang = "ru" if any("\u0400" <= c <= "\u04ff" for c in args.text) else "en"
+        model.generate_to_file(args.text, args.output, voice=args.voice,
+                               preset="expressive", normalize=lang != "ru",
+                               advanced={"seed": 1234})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-dir", type=Path, required=True)
@@ -45,6 +57,7 @@ def main():
     parser.add_argument("--text", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--voice", default="Bruno")
+    parser.add_argument("--lang", choices=("auto", "en", "ru"), default="auto")
     parser.add_argument("--decoder", default="default")
     parser.add_argument("--threads", type=int, default=6)
     parser.add_argument("--decoder-threads", type=int, default=2)
@@ -72,11 +85,7 @@ def main():
             cpu_start = resource.getrusage(resource.RUSAGE_SELF)
             generation_start = time.monotonic()
             with redirect_stdout(sys.stderr):
-                if args.family == "mini":
-                    model.generate_to_file(args.text, args.output, voice=args.voice)
-                else:
-                    model.generate_to_file(args.text, args.output, voice=args.voice,
-                                           advanced={"seed": 1234})
+                _generate(model, args)
             generation_seconds = time.monotonic() - generation_start
             usage = resource.getrusage(resource.RUSAGE_SELF)
             cpu_seconds = (usage.ru_utime + usage.ru_stime - cpu_start.ru_utime - cpu_start.ru_stime)

@@ -36,6 +36,8 @@ services:
       - label=disable
     env_file:
       - config.env
+      - path: .env
+        required: false
     environment:
       DATA_DIR: /data
       TTS_DIR: /data/tts
@@ -49,10 +51,13 @@ services:
       STT_THREADS: "6"
       PLAYER_ENABLED: "1"
       CAST_NAME: Office speaker
-    mem_limit: 3g
-    memswap_limit: 3g
+      OMNIVOICE_PYTHON: /opt/omnivoice/bin/python
+    mem_limit: 8g
+    memswap_limit: 8g
     volumes:
       - ./data:/data
+      - ./models/omnivoice:/app/models/omnivoice:ro
+      - ./models/omnivoice-voices:/app/models/omnivoice-voices:ro
     restart: "no"
     depends_on:
       proxy:

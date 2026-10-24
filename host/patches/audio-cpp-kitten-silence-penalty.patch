@@ -1,0 +1,11 @@
+--- a/src/community_models/kitten_tts2/session.cpp
++++ b/src/community_models/kitten_tts2/session.cpp
+@@ -487,7 +487,7 @@
+             std::unordered_set<int32_t> seen;
+             for (size_t i=codes.size()>50?codes.size()-50:0;i<codes.size();++i) {
+                 auto code=codes[i];
+-                if (code==4299 || !seen.insert(code).second) continue;
++                if (!seen.insert(code).second) continue;
+                 logits[code]=logits[code]<0?logits[code]*repetition:logits[code]/repetition;
+             }
+             auto token=sampler.sample(logits,{},sampling_options,scratch,rng,nullptr,"Kitten TTS 2");

@@ -11,6 +11,7 @@ traffic is rejected locally to force IPv4 fallback. LAN multicast is unchanged.
 Ctrl-C, a duration limit, or systemd stopping the service removes the nft table and restores the ARP entry.
 """
 import argparse
+import errno
 import ipaddress
 import json
 import os
@@ -28,6 +29,81 @@ from http.client import HTTPException
 from pathlib import Path
 
 STOP = threading.Event()
+# Errors from a raw socket whose interface went down, vanished, or is briefly
+# out of buffers. These are transient: wait for the link instead of exiting.
+LINK_ERRORS = frozenset({errno.ENETDOWN, errno.ENXIO, errno.ENODEV, errno.ENOBUFS})
+
+
+def open_raw(interface):
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+    try:
+        sock.bind((interface, 0))
+        sock.settimeout(0.3)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+class RawLink:
+    """Raw Ethernet socket that survives the interface going down or being re-created."""
+
+    def __init__(self, interface, record, opener=open_raw):
+        self.interface, self.record, self.opener = interface, record, opener
+        self.sock = opener(interface)
+        self.down = False
+
+    def _failed(self, error):
+        if error.errno not in LINK_ERRORS:
+            return False
+        if not self.down:
+            self.down = True
+            self.record(kind='link_down', interface=self.interface, error=str(error))
+        self.close()  # Rebind later: a re-created interface gets a new ifindex.
+        return True
+
+    def _ready(self):
+        if self.sock is None:
+            try:
+                self.sock = self.opener(self.interface)
+            except OSError as error:
+                if error.errno not in LINK_ERRORS:
+                    raise
+                return False
+        return True
+
+    def send(self, frame):
+        """Send a frame; return False instead of raising while the link is down."""
+        if not self._ready():
+            return False
+        try:
+            self.sock.send(frame)
+        except OSError as error:
+            if not self._failed(error):
+                raise
+            return False
+        if self.down:
+            self.down = False
+            self.record(kind='link_up', interface=self.interface)
+        return True
+
+    def recv(self):
+        """Return a frame, or None on timeout or while the link is down."""
+        if not self._ready():
+            return None
+        try:
+            return self.sock.recv(65535)
+        except socket.timeout:
+            return None
+        except OSError as error:
+            if not self._failed(error):
+                raise
+            return None
+
+    def close(self):
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
 
 
 def monitor_nest(nest, expected_mac, connected, record, stop=STOP):
@@ -186,11 +262,9 @@ def main():
             pass
     table = f'nest_lab_{os.getpid()}'
     try:
-        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+        link = RawLink(args.interface, record)
     except PermissionError:
         parser.error('Raw networking is denied even as root. This is commonly a rootless container; run the helper in the host OS terminal, outside the container. No ARP or nft changes have been made.')
-    sock.bind((args.interface, 0))
-    sock.settimeout(0.3)
     connected = threading.Event()
     monitor = threading.Thread(target=monitor_nest,
                                args=(args.nest, args.nest_mac, connected, record), daemon=True)
@@ -269,13 +343,14 @@ def main():
                 was_connected = True
             now = time.monotonic()
             if now >= next_arp:
-                sock.send(arp_reply(local_mac, args.gateway, nest_mac, args.nest))
-                if gateway6:
-                    sock.send(neighbor_advertisement(local_mac, nest_mac, gateway6, nest6, local_mac))
+                # The first successful send after an outage reapplies the redirect.
+                if link.send(arp_reply(local_mac, args.gateway, nest_mac, args.nest)) and gateway6:
+                    link.send(neighbor_advertisement(local_mac, nest_mac, gateway6, nest6, local_mac))
                 next_arp = now + 1
-            try:
-                frame = sock.recv(65535)
-            except socket.timeout:
+            frame = link.recv()
+            if frame is None:
+                if link.down:
+                    STOP.wait(1)
                 continue
             if (len(frame) >= 54 and frame[:6] == local_mac and frame[6:12] == nest_mac
                     and frame[12:14] == b'\x86\xdd'):
@@ -286,7 +361,7 @@ def main():
                     source6 = socket.inet_ntop(socket.AF_INET6, packet6[8:24])
                     destination6 = socket.inet_ntop(socket.AF_INET6, packet6[24:40])
                     error = struct.pack('!BBHI', 1, 1, 0, 0) + packet6[:1232]
-                    sock.send(ipv6_frame(local_mac, nest_mac, gateway6, source6, error, 64))
+                    link.send(ipv6_frame(local_mac, nest_mac, gateway6, source6, error, 64))
                     record(kind='ipv6_rejected', source=source6, dst=destination6, protocol=packet6[6])
                     last_ipv6_reject = observed
                 continue
@@ -317,7 +392,7 @@ def main():
             result = dns_answer(udp[8:size], args.pc)
             if result:
                 answer, name, qtype = result
-                sock.send(udp_frame(local_mac, nest_mac, socket.inet_ntoa(ip[16:20]), args.nest, 53, src_port, answer))
+                link.send(udp_frame(local_mac, nest_mac, socket.inet_ntoa(ip[16:20]), args.nest, 53, src_port, answer))
                 record(kind='dns', name=name, type=qtype, answer=args.pc if qtype == 1 else 'empty')
     finally:
         STOP.set()
@@ -330,14 +405,14 @@ def main():
             for _ in range(5):
                 # Keep the Ethernet source as this PC to avoid teaching the LAN
                 # switch that the router's own MAC moved to this PC's port.
-                sock.send(arp_reply(gateway_mac, args.gateway, nest_mac, args.nest, local_mac))
+                link.send(arp_reply(gateway_mac, args.gateway, nest_mac, args.nest, local_mac))
                 if gateway6:
-                    sock.send(neighbor_advertisement(local_mac, nest_mac, gateway6, nest6, gateway6_mac))
+                    link.send(neighbor_advertisement(local_mac, nest_mac, gateway6, nest6, gateway6_mac))
                 time.sleep(0.1)
         for server in servers:
             server.shutdown()
             server.server_close()
-        sock.close()
+        link.close()
         print('Stopped; temporary nft table removed and Nest gateway ARP restored.', flush=True)
         record(kind='stopped', table=table)
         os.close(log_fd)

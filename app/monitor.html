@@ -140,7 +140,10 @@ function steps(task){
     let controls="";
     if(name==="tts"&&tts.metrics){
       const m=tts.metrics;
-      controls=`<div class="hint">${esc((m.load_seconds+m.generation_seconds).toFixed(1))} s total · ${esc(m.audio_seconds)} s audio · ${esc(m.peak_rss_mib)} MiB peak RAM</div>`;
+      const memory=m.vram_free_mib!=null?`${esc(m.vram_free_mib)} MiB VRAM free`:`${esc(m.peak_rss_mib)} MiB peak RAM`;
+      const steps=m.steps?` · ${esc(m.steps)} steps`:"";
+      controls=`<div class="hint">${esc((m.load_seconds+m.generation_seconds).toFixed(1))} s total · ${esc(m.audio_seconds)} s audio${steps} · ${memory}</div>`;
+      if(tts.cpu_reason&&m.vram_free_mib==null)controls+=`<div class="hint">CPU because ${esc(tts.cpu_reason)}</div>`;
     }
     if(test&&!task.interrupt_requested&&name==="received"&&st?.status==="waiting"){
       const active=state.recording?.id===task.id,starting=state.starting===task.id;

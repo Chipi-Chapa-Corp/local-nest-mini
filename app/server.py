@@ -4,6 +4,7 @@
 import json
 import math
 import os
+import re
 import subprocess
 import threading
 import tempfile
@@ -35,8 +36,22 @@ OMNIVOICE_PYTHON = Path(os.environ.get("OMNIVOICE_PYTHON", str(PROJECT_DIR / "mo
 OMNIVOICE_DIR = Path(os.environ.get("OMNIVOICE_DIR", str(PROJECT_DIR / "models/omnivoice")))
 OMNIVOICE_REFERENCE = Path(os.environ.get("OMNIVOICE_REFERENCE", str(PROJECT_DIR / "models/omnivoice-voices/laylo-en.wav")))
 OMNIVOICE_THREADS = int(os.environ.get("OMNIVOICE_THREADS", "6"))
-OMNIVOICE_STEPS_EN = int(os.environ.get("OMNIVOICE_STEPS_EN", "16"))
-OMNIVOICE_STEPS_RU = int(os.environ.get("OMNIVOICE_STEPS_RU", "32"))
+# CPU fallback steps match the GPU setting by default (closest equivalent setup).
+OMNIVOICE_STEPS_EN = int(os.environ.get("OMNIVOICE_STEPS_EN", "24"))
+OMNIVOICE_STEPS_RU = int(os.environ.get("OMNIVOICE_STEPS_RU", "24"))
+# GPU path: omnivoice.cpp on Vulkan, used per reply when enough VRAM is free.
+OMNIVOICE_GPU = os.environ.get("OMNIVOICE_GPU", "auto").lower()  # auto | off
+OMNIVOICE_GPU_BIN = Path(os.environ.get(
+    "OMNIVOICE_GPU_BIN", str(PROJECT_DIR / "models/omnivoice-cpp-src/build-vulkan/omnivoice-tts")))
+OMNIVOICE_GGUF_DIR = Path(os.environ.get("OMNIVOICE_GGUF_DIR", str(PROJECT_DIR / "models/omnivoice-cpp-gguf")))
+OMNIVOICE_GPU_MODEL = Path(os.environ.get("OMNIVOICE_GPU_MODEL", str(OMNIVOICE_GGUF_DIR / "omnivoice-base-Q8_0.gguf")))
+OMNIVOICE_GPU_CODEC = Path(os.environ.get(
+    "OMNIVOICE_GPU_CODEC", str(OMNIVOICE_GGUF_DIR / "omnivoice-tokenizer-F32.gguf")))
+OMNIVOICE_GPU_DEVICE = os.environ.get("OMNIVOICE_GPU_DEVICE", "Vulkan0")
+OMNIVOICE_GPU_STEPS = int(os.environ.get("OMNIVOICE_GPU_STEPS", "24"))
+# Q8_0 peaked at 1.3-1.6 GiB of VRAM in benchmarks; require more than 1.7 GiB free.
+OMNIVOICE_GPU_MIN_FREE_MIB = float(os.environ.get("OMNIVOICE_GPU_MIN_FREE_MIB", "1740"))  # 1.7 GiB
+DRM_ROOT = Path("/sys/class/drm")
 OMNIVOICE_LOCK = threading.Lock()
 KITTEN_PYTHON = Path(os.environ.get("KITTEN_PYTHON", str(PROJECT_DIR / "models/kitten-env/bin/python")))
 KITTEN_CACHE = Path(os.environ.get("KITTEN_CACHE", str(PROJECT_DIR / "models/kitten-tts-2")))
@@ -207,15 +222,110 @@ def _omnivoice_ready():
             "audio_tokenizer/preprocessor_config.json"))
 
 
+def _omnivoice_gpu_ready():
+    return (OMNIVOICE_GPU != "off" and os.access(OMNIVOICE_GPU_BIN, os.X_OK)
+            and OMNIVOICE_GPU_MODEL.is_file() and OMNIVOICE_GPU_CODEC.is_file()
+            and OMNIVOICE_REFERENCE.is_file())
+
+
+def _gpu_free_vram_mib(root=None):
+    """Free VRAM of the GPU with the most VRAM (the discrete card), from amdgpu sysfs.
+
+    Two small file reads (~50 µs). None when no card reports VRAM.
+    """
+    best = None
+    for card in Path(root or DRM_ROOT).glob("card*"):
+        if not card.name[4:].isdigit():
+            continue  # connector entries such as card1-DP-1
+        try:
+            total = int((card / "device/mem_info_vram_total").read_text())
+            used = int((card / "device/mem_info_vram_used").read_text())
+        except (OSError, ValueError):
+            continue
+        if best is None or total > best[0]:
+            best = (total, used)
+    return None if best is None else (best[0] - best[1]) / 1048576
+
+
+# OmniVoice's non-verbal tags, plus any other bracketed ASCII markup an LLM may emit.
+SOUND_TAG = re.compile(r"\s*\[[A-Za-z][A-Za-z0-9_-]*\]")
+
+
+def _strip_sound_tags(text):
+    text = SOUND_TAG.sub(" ", text)
+    text = re.sub(r"\s+([,.!?;:…])", r"\1", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _synthesize_omnivoice_gpu(text, lang, output, task_id, free_mib):
+    """Run omnivoice.cpp on Vulkan; return its metrics or raise."""
+    from .omnivoice_tts import REFERENCE_TEXT
+    reference_rvq = OMNIVOICE_REFERENCE.with_suffix(".rvq")
+    with tempfile.TemporaryDirectory(prefix="omnivoice-gpu-") as temp:
+        ref_text = Path(temp) / "reference.txt"
+        ref_text.write_text(REFERENCE_TEXT)
+        reference = (["--ref-rvq", reference_rvq] if reference_rvq.is_file()
+                     else ["--ref-wav", OMNIVOICE_REFERENCE])
+        started = time.monotonic()
+        result = _run([
+            OMNIVOICE_GPU_BIN, "--device", OMNIVOICE_GPU_DEVICE,
+            "--model", OMNIVOICE_GPU_MODEL, "--codec", OMNIVOICE_GPU_CODEC,
+            "--lang", lang, *reference, "--ref-text", ref_text,
+            "--seed", "1234", "--steps", OMNIVOICE_GPU_STEPS, "-o", output,
+        ], timeout=120, stdin=text.encode(), task_id=task_id)
+        wall = time.monotonic() - started
+    log = (result.stdout + result.stderr).decode(errors="replace")
+    if result.returncode or not output.is_file() or output.stat().st_size <= 44:
+        raise RuntimeError(log.strip()[-2000:] or "OmniVoice GPU generation failed")
+    synth = re.search(r"\[Perf\] Total ([\d.]+) ms", log)
+    audio = re.findall(r"Post-proc: .*\(([\d.]+)s at", log)
+    generation = float(synth.group(1)) / 1000 if synth else wall
+    audio_seconds = sum(float(value) for value in audio)
+    return dict(backend="omnivoice-vulkan", engine="omnivoice.cpp / Vulkan", device=OMNIVOICE_GPU_DEVICE,
+                precision="Q8_0 transformer / F32 codec", language=lang, steps=OMNIVOICE_GPU_STEPS,
+                load_seconds=round(wall - generation, 3), generation_seconds=round(generation, 3),
+                audio_seconds=round(audio_seconds, 3),
+                rtf=round(generation / audio_seconds, 3) if audio_seconds else None,
+                vram_free_mib=round(free_mib))
+
+
 def _synthesize_omnivoice(text, lang, output, task_id):
     if not _omnivoice_ready():
         raise RuntimeError("OmniVoice environment, model or voice reference missing; run host/setup-omnivoice.sh")
+    text = _strip_sound_tags(text)
+    if not text:
+        raise ValueError("text must contain speech, not only sound tags")
     if task_id:
-        TASKS.start(task_id, "tts", engine="OmniVoice CPU")
+        TASKS.start(task_id, "tts", engine="OmniVoice")
     while not OMNIVOICE_LOCK.acquire(timeout=.2):
         TASKS.check(task_id)
     try:
         TASKS.check(task_id)
+        # Probe VRAM after the lock, right before running: a game may have started meanwhile.
+        gpu_ready = _omnivoice_gpu_ready()
+        free = _gpu_free_vram_mib() if gpu_ready else None
+        if not gpu_ready:
+            cpu_reason = "GPU disabled or not set up"
+        elif free is None:
+            cpu_reason = "no VRAM information"
+        else:
+            cpu_reason = f"{free:.0f} MiB VRAM free, need more than {OMNIVOICE_GPU_MIN_FREE_MIB:.0f}"
+        if free is not None and free > OMNIVOICE_GPU_MIN_FREE_MIB:
+            if task_id:
+                TASKS.start(task_id, "tts", engine="OmniVoice GPU (Vulkan)")
+            try:
+                report = _synthesize_omnivoice_gpu(text, lang, output, task_id, free)
+                if task_id:
+                    TASKS.start(task_id, "tts", metrics=report)
+                return output
+            except TaskCancelled:
+                raise
+            except Exception as exc:
+                output.unlink(missing_ok=True)
+                cpu_reason = f"GPU failed: {str(exc).strip().splitlines()[-1] if str(exc).strip() else type(exc).__name__}"
+                print(json.dumps({"kind": "omnivoice_gpu_failed", "error": str(exc)[-2000:]}), flush=True)
+        if task_id:
+            TASKS.start(task_id, "tts", engine="OmniVoice CPU", cpu_reason=cpu_reason)
         result = _run([
             OMNIVOICE_PYTHON, Path(__file__).with_name("omnivoice_tts.py"),
             "--model-dir", OMNIVOICE_DIR, "--reference", OMNIVOICE_REFERENCE,
@@ -416,6 +526,8 @@ class Handler(BaseHTTPRequestHandler):
                 "whisper": WHISPER_BIN.is_file(),
                 "tts": _omnivoice_ready() if TTS_BACKEND == "omnivoice" else _kitten_ready() if TTS_BACKEND in {"kitten", "kitten-mini"} else POCKET_BIN.is_file(),
                 "tts_backend": TTS_BACKEND,
+                # Informational (a string, so it never fails the check): CPU covers an absent GPU.
+                "tts_gpu": ("ready" if _omnivoice_gpu_ready() else "unavailable") if TTS_BACKEND == "omnivoice" else "n/a",
                 "tts_backend_supported": TTS_BACKEND in {"omnivoice", "pocket", "kitten", "kitten-mini"},
                 "russian_tts": _omnivoice_ready() if TTS_BACKEND == "omnivoice" else _kitten_ready() if TTS_BACKEND == "kitten" else POCKET_BIN.is_file() and RU_CONFIG.is_file() and RU_VOICE.is_file(),
                 "tts_dir": TTS_DIR.is_dir(),

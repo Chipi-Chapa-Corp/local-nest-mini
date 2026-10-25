@@ -64,6 +64,15 @@ if [[ "$ASSISTANT_ENABLED" == 1 ]]; then
       echo "OmniVoice dependencies are missing for the service account; run bash host/setup-omnivoice.sh" >&2
       exit 1
     fi
+    # The GPU path is optional: without it every reply uses the CPU.
+    gpu_bin="${OMNIVOICE_GPU_BIN:-$PROJECT_DIR/models/omnivoice-cpp-src/build-vulkan/omnivoice-tts}"
+    if [[ "${OMNIVOICE_GPU:-auto}" == off ]]; then
+      echo "OmniVoice GPU disabled; replies use the CPU"
+    elif [[ -x "$gpu_bin" ]] && grep -q Usage < <("$gpu_bin" --help 2>&1); then
+      echo "OmniVoice GPU available; used when more than ${OMNIVOICE_GPU_MIN_FREE_MIB:-1740} MiB VRAM is free"
+    else
+      echo "OmniVoice GPU build missing or not runnable; replies use the CPU (run host/setup-omnivoice-vulkan.sh)"
+    fi
   fi
   [[ -s "$STT_MODEL" ]] || { echo "missing STT model: $STT_MODEL" >&2; exit 1; }
   "$WHISPER_BIN" --help >/dev/null 2>&1 || {

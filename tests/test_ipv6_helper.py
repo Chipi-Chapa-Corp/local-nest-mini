@@ -1,3 +1,4 @@
+import errno
 import io
 import json
 import socket
@@ -6,7 +7,83 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from nest_network_helper import checksum, link_local, macbytes, monitor_nest, neighbor_advertisement
+from nest_network_helper import (RawLink, checksum, link_local, macbytes, monitor_nest,
+                                 neighbor_advertisement)
+
+
+class FakeSocket:
+    def __init__(self, sends=(), recvs=()):
+        self.sends, self.recvs, self.sent, self.closed = list(sends), list(recvs), [], False
+
+    @staticmethod
+    def _next(script, value):
+        result = script.pop(0) if script else value
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def send(self, frame):
+        self._next(self.sends, None)
+        self.sent.append(frame)
+
+    def recv(self, _size):
+        return self._next(self.recvs, b"frame")
+
+    def close(self):
+        self.closed = True
+
+
+class RawLinkTest(unittest.TestCase):
+    def link(self, *openings):
+        events, opened = [], []
+        script = list(openings)
+
+        def opener(interface):
+            self.assertEqual(interface, "eno1")
+            result = script.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            opened.append(result)
+            return result
+        return RawLink("eno1", lambda **event: events.append(event["kind"]), opener), events, opened
+
+    def test_link_down_waits_rebinds_and_resumes(self):
+        down = OSError(errno.ENETDOWN, "Network is down")
+        first = FakeSocket(sends=[down])
+        second = FakeSocket(sends=[down])
+        third = FakeSocket()
+        link, events, opened = self.link(
+            first, OSError(errno.ENODEV, "No such device"), second, third)
+        self.assertFalse(link.send(b"arp"))  # the crash from the service journal
+        self.assertTrue(first.closed and link.down)
+        self.assertFalse(link.send(b"arp"))  # interface missing while it is re-created
+        self.assertFalse(link.send(b"arp"))  # back, but still without carrier
+        self.assertTrue(link.send(b"arp"))
+        self.assertEqual(third.sent, [b"arp"])
+        self.assertEqual(opened, [first, second, third])
+        self.assertEqual(events, ["link_down", "link_up"])  # one event per outage
+        self.assertFalse(link.down)
+
+    def test_recv_reports_timeout_and_link_errors_as_no_frame(self):
+        first = FakeSocket(recvs=[socket.timeout(), OSError(errno.ENETDOWN, "Network is down")])
+        second = FakeSocket(recvs=[b"frame"])
+        link, events, _ = self.link(first, second)
+        self.assertIsNone(link.recv())
+        self.assertFalse(link.down)
+        self.assertIsNone(link.recv())
+        self.assertTrue(link.down)
+        self.assertEqual(link.recv(), b"frame")
+        self.assertEqual(events, ["link_down"])  # recovered only once a send succeeds
+
+    def test_unexpected_socket_errors_still_raise(self):
+        link, _, _ = self.link(FakeSocket(sends=[OSError(errno.EINVAL, "Invalid argument")]))
+        with self.assertRaises(OSError):
+            link.send(b"arp")
+        broken, _, _ = self.link(FakeSocket(sends=[OSError(errno.ENETDOWN, "down")]),
+                                 PermissionError(errno.EPERM, "denied"))
+        self.assertFalse(broken.send(b"arp"))
+        with self.assertRaises(PermissionError):
+            broken.send(b"arp")
 
 
 class IPv6HelperTest(unittest.TestCase):

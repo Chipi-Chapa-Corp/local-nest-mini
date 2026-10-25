@@ -45,7 +45,7 @@ class ProcessorTests(unittest.TestCase):
     def setUp(self):
         self.api.requests = []
         self.api.status = 200
-        self.reply = "Привет! [laughter] Как дела?"
+        self.reply = "Привет! Как дела?"
         self.api.body = json.dumps({"choices": [{"message": {"content": self.reply}}]}).encode()
         env = patch.dict(os.environ, {
             "LLM_BASE_URL": f"http://127.0.0.1:{self.api.server_port}/v1/",
@@ -73,15 +73,14 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(self.api.requests[0]["authorization"], "Bearer test-key")
         self.assertEqual(self.api.requests[0]["body"]["reasoning_effort"], "low")
 
-    def test_prompt_always_uses_native_sounds_without_legacy_controls(self):
+    def test_prompt_asks_for_plain_speech_without_sound_tags(self):
         for backend in ("omnivoice", "kitten"):
             with self.subTest(backend=backend), patch.dict(os.environ, {"TTS_BACKEND": backend}):
                 processor.respond("Hello")
                 prompt = self.api.requests[-1]["body"]["messages"][0]["content"]
                 self.assertEqual(prompt, processor.SYSTEM_PROMPT)
-                self.assertIn("[laughter]", prompt)
-                self.assertIn("[dissatisfaction-hnn]", prompt)
-                for legacy in ("[emotion]", "[joyful]", "<sound>", "(((", "# Voice"):
+                self.assertNotRegex(prompt, r"\[[A-Za-z-]+\]")  # no sound tags offered
+                for legacy in ("<sound>", "(((", "# Voice", "# Sounds"):
                     self.assertNotIn(legacy, prompt)
 
     def test_empty_input_and_missing_configuration_do_not_call_api(self):

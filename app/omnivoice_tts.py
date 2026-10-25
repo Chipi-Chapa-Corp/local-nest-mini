@@ -56,7 +56,7 @@ def main():
     parser.add_argument("--text", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--lang", choices=("en", "ru"), required=True)
-    parser.add_argument("--steps", type=int, choices=(16, 32))
+    parser.add_argument("--steps", type=int, choices=(16, 24, 32))
     parser.add_argument("--threads", type=int, default=6)
     parser.add_argument("--bootstrap-reference", action="store_true",
                         help="Setup only: generate an English reference without an existing voice")

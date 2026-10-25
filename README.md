@@ -20,6 +20,7 @@ app/server.py               Whisper STT → app/processor.py → TTS
 1. Put the files that are not in git in place:
    - `bin/whisper-cli` (static whisper.cpp) and `models/stt/futo.bin`
    - OmniVoice CPU environment, pinned model and voice reference: run `bash host/setup-omnivoice.sh`
+   - optional OmniVoice GPU (Vulkan) build: run `bash host/setup-omnivoice-vulkan.sh` in the build toolbox
    - captures from your own Nest: `data/native-template.bin`, `data/native-nospeech.bin`, `data/offline-account-ids.json`
 2. `cp config.env.example config.env`, then set the Nest and network values.
    Copy `.env.example` to `.env` and set `LLM_BASE_URL` (including `/v1` when
@@ -73,22 +74,31 @@ receiver SDK, then restart. The proxy serves a local WAV receiver at the Nest's
 default receiver URL; other Google requests stay blocked. No receiver assets
 are downloaded at runtime.
 
-Optimized **OmniVoice** is the default for English and Russian. It runs on CPU
-with six threads, a BF16 transformer and an FP32 audio codec. English uses
-16 refinement steps; Russian uses 32. Both use the saved synthetic English voice
-reference to avoid unstable voice-design generations. Text normalization is
-disabled; Laylo writes numbers as spoken words.
-The LLM prompt uses OmniVoice's native square-bracket sound tags. Each TTS task
-reports generation time, CPU usage and peak RAM. Requests are serialized, and
-the worker releases the model after each request. Runtime inference is offline.
+**OmniVoice** is the default for English and Russian, with 24 refinement steps.
+Each reply first checks free VRAM on the discrete GPU (two amdgpu sysfs reads).
+With more than 1.7 GiB free it runs
+[omnivoice.cpp](https://github.com/ServeurpersoCom/omnivoice.cpp) on Vulkan with a
+Q8_0 transformer and F32 codec: about 2.3 s for a 5.7 s Russian reply, peaking at
+1.3–1.6 GiB VRAM, released when the reply is done. Otherwise, or if the GPU run
+fails, it uses the optimized PyTorch CPU path (six threads, BF16 transformer, FP32
+codec): about 13 s for the same reply and 5 GiB RAM. Both clone the saved
+synthetic English voice reference, so their voices match closely but not
+bit-for-bit. Text normalization is disabled; Laylo writes numbers as spoken words.
+The LLM prompt asks for plain speech, and square-bracket sound tags are removed
+before synthesis. Each TTS task reports the engine, timing, and VRAM or RAM; a CPU
+run also records why the GPU was skipped. Requests are serialized. Runtime
+inference is offline.
 
-For this upgrade, run `bash host/setup-omnivoice.sh`, select
-`TTS_BACKEND=omnivoice` in `config.env`, then run **`./run.sh install`** to install
-the updated memory limits and restart. A restart alone does not update the unit:
-the service now has `MemoryHigh=6G` and `MemoryMax=8G`, because measured OmniVoice
-peak RSS reaches about 5.2 GiB. Model settings are `OMNIVOICE_THREADS=6`,
-`OMNIVOICE_STEPS_EN=16`, and `OMNIVOICE_STEPS_RU=32`; paths can be overridden with
-`OMNIVOICE_PYTHON`, `OMNIVOICE_DIR`, and `OMNIVOICE_REFERENCE`.
+Setup: `bash host/setup-omnivoice.sh` (CPU path, required), then optionally
+`bash host/setup-omnivoice-vulkan.sh` inside the build toolbox (GPU path). Select
+`TTS_BACKEND=omnivoice` in `config.env` and run **`./run.sh install`**; the unit
+has `MemoryHigh=6G` and `MemoryMax=8G` for the CPU path's ~5.2 GiB peak. Settings:
+`OMNIVOICE_GPU=auto|off`, `OMNIVOICE_GPU_MIN_FREE_MIB=1740`,
+`OMNIVOICE_GPU_STEPS=24`, `OMNIVOICE_GPU_DEVICE=Vulkan0`, `OMNIVOICE_THREADS=6`,
+`OMNIVOICE_STEPS_EN=24`, `OMNIVOICE_STEPS_RU=24`. Paths can be overridden with
+`OMNIVOICE_PYTHON`, `OMNIVOICE_DIR`, `OMNIVOICE_REFERENCE`, `OMNIVOICE_GPU_BIN`,
+`OMNIVOICE_GPU_MODEL`, and `OMNIVOICE_GPU_CODEC`. Measurements are in
+`data/benchmarks/ru-reply-compare/`.
 
 Compose builds the separate CPU inference environment and mounts local model/voice
 assets read-only, with an 8 GiB assistant limit. Run the setup script before

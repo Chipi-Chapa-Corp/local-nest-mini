@@ -1,7 +1,8 @@
 [Unit]
 Description=Local Nest Mini proxy, assistant, and network helper
 Wants=network-online.target
-After=network-online.target
+After=network-online.target local-infra-gateway.service
+Requires=local-infra-gateway.service
 StartLimitIntervalSec=300
 StartLimitBurst=6
 

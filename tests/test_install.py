@@ -63,6 +63,9 @@ class InstallTests(unittest.TestCase):
         if shutil.which("systemd-analyze"):
             unit = self.base / "local-nest-mini.service"
             unit.write_text(moved.stdout)
+            # The managed Nest unit now depends on the shared gateway.
+            (self.base / "local-infra-gateway.service").write_text(
+                "[Service]\nType=oneshot\nExecStart=/usr/bin/true\n")
             verified = self.run_command("systemd-analyze", "verify", str(unit))
             self.assertEqual(verified.returncode, 0, verified.stderr)
 

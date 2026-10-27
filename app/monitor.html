@@ -105,7 +105,7 @@ pre{margin:0;padding:4px 20px 16px;color:var(--muted);font:12.5px/1.55 ui-monosp
 </main>
 <script>
 const $=id=>document.getElementById(id);
-function icon(name,cls=""){return `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="/icons.svg#${name}"></use></svg>`}
+function icon(name,cls=""){return `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="icons.svg#${name}"></use></svg>`}
 const LANG={en:"English",ru:"Russian"};
 const state={paused:false,showAll:false,open:new Set(),last:{},tasks:[],recording:null,starting:null,uploading:null,playing:null,messages:new Map()};
 const player=new Audio();
@@ -190,20 +190,20 @@ async function api(path,body){
 function message(id,error){state.messages.set(id,error.message||String(error));renderTasks()}
 async function action(id,name,body){
   state.messages.delete(id);
-  try{await api(`/api/tests/${encodeURIComponent(id)}/${name}`,body);await refresh()}
+  try{await api(`api/tests/${encodeURIComponent(id)}/${name}`,body);await refresh()}
   catch(error){message(id,error)}
 }
 async function interrupt(id){
   if(state.recording?.id===id){state.recording.cancelled=true;state.recording.recorder.stop()}
   if(state.playing===id)stopPlayer();
-  try{await api(`/api/tasks/${encodeURIComponent(id)}/interrupt`);await refresh()}
+  try{await api(`api/tasks/${encodeURIComponent(id)}/interrupt`);await refresh()}
   catch(error){message(id,error)}
 }
 function stopPlayer(){player.pause();state.playing=null;renderTasks()}
 function play(id){
   if(state.playing===id){stopPlayer();return}
   player.pause();state.playing=id;state.messages.delete(id);
-  player.src=`/api/tests/${encodeURIComponent(id)}/audio`;
+  player.src=`api/tests/${encodeURIComponent(id)}/audio`;
   renderTasks();
   player.play().catch(error=>{if(state.playing===id){state.playing=null;message(id,error)}});
 }
@@ -284,7 +284,7 @@ function setStatus(cls,text){$("status").className="status "+cls;$("status-text"
 
 async function refresh(){
   try{
-    const [t,r]=await Promise.all([fetch("/api/tasks").then(x=>x.json()),fetch("/api/requests").then(x=>x.json())]);
+    const [t,r]=await Promise.all([fetch("api/tasks").then(x=>x.json()),fetch("api/requests").then(x=>x.json())]);
     const ts=JSON.stringify(t.tasks),rs=JSON.stringify(r.requests);
     if(ts!==state.last.tasks){state.last.tasks=ts;renderTasks(t.tasks||[])}
     if(rs!==state.last.requests){state.last.requests=rs;renderRequests(r.requests||[])}
@@ -298,7 +298,7 @@ $("refresh").innerHTML=icon("refresh-cw");
 $("test").innerHTML=icon("flask-conical")+"Test";
 $("test").onclick=async()=>{
   $("test").disabled=true;$("test-notice").textContent="";
-  try{await api("/api/tests");await refresh()}
+  try{await api("api/tests");await refresh()}
   catch(error){$("test-notice").textContent=error.message}
   finally{$("test").disabled=false}
 };

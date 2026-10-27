@@ -211,6 +211,7 @@ def main():
     parser.add_argument('--pc', required=True)
     parser.add_argument('--gateway', required=True)
     parser.add_argument('--duration', type=int, default=900, help='seconds; 0 means run until stopped')
+    parser.add_argument('--shared-http', action='store_true', help='Shared local-infra gateway owns port 80 and routes Nest traffic to 18081')
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('Run in the host terminal with sudo; raw Ethernet and temporary nft rules require root.')
@@ -294,7 +295,7 @@ def main():
     servers = []
     applied = False
     try:
-        for port in (443, 80):
+        for port in ((443,) if args.shared_http else (443, 80)):
             server = Server((args.pc, port), Bridge)
             threading.Thread(target=server.serve_forever, daemon=True).start()
             servers.append(server)

@@ -1,5 +1,13 @@
 # local-nest-mini
 
+Managed by `~/Projects/Misc/local-infra/`, under `services/local-nest-mini/`.
+The former `~/Projects/Hardware/local-nest-mini` path is a compatibility symlink.
+The shared HTTP gateway routes this Nest’s port 80 traffic to the existing local
+proxy on 18081; the helper retains its device-only port 443 bridge and DNS/ARP/NDP
+rules. Its `--shared-http` flag prevents a competing port 80 listener.
+Monitor: **http://kitkat-pc/nest/**. Port 80 ownership and startup live in
+local-infra; `local-nest-mini.service` requires `local-infra-gateway.service`.
+
 A Nest Mini answered by this PC instead of Google. Nothing is forwarded to Google.
 
 ```

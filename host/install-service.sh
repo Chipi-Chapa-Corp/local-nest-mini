@@ -14,6 +14,11 @@ set -a
 set +a
 : "${NEST_IP:?missing NEST_IP}"
 
+if ! systemctl cat local-infra-gateway.service >/dev/null 2>&1; then
+  echo 'Install the shared gateway first: sudo bash ~/Projects/Misc/local-infra/scripts/install-gateway.sh' >&2
+  exit 1
+fi
+
 # Always prepare: imports alone don't detect stale launchers or missing CA files.
 if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
   sudo -u "$SUDO_USER" bash "$PROJECT_DIR/host/setup-host.sh"

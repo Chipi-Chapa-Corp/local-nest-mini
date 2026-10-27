@@ -207,7 +207,8 @@ python3 "$PROJECT_DIR/nest_network_helper.py" \
   --nest-mac "$NEST_MAC" \
   --pc "$PC_IP" \
   --gateway "$GATEWAY" \
-  --duration "$SERVICE_DURATION" &
+  --duration "$SERVICE_DURATION" \
+  --shared-http &
 helper_pid=$!
 
 pids=("$proxy_pid" "$helper_pid")

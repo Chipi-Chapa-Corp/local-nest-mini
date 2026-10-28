@@ -72,8 +72,7 @@ and TTS remain local; transcripts go to your configured LLM provider. API failur
 fail the processing stage without generating fallback speech.
 
 LLM and local assistant HTTP requests allow five minutes (300 seconds) per
-request; `/answer` includes both LLM generation and TTS. Whisper, Kitten and
-Pocket inference also allow five minutes. OmniVoice retains its longer internal
+request; `/answer` includes both LLM generation and TTS. Whisper inference also allows five minutes. OmniVoice retains its internal
 ten-minute limit. S3 heartbeats continue during processing, but these timeouts
 do not override any deadline enforced by the Nest itself.
 
@@ -105,34 +104,15 @@ has `MemoryHigh=6G` and `MemoryMax=8G` for the CPU path's ~5.2 GiB peak. Setting
 `OMNIVOICE_GPU_STEPS=24`, `OMNIVOICE_GPU_DEVICE=Vulkan0`, `OMNIVOICE_THREADS=6`,
 `OMNIVOICE_STEPS_EN=24`, `OMNIVOICE_STEPS_RU=24`. Paths can be overridden with
 `OMNIVOICE_PYTHON`, `OMNIVOICE_DIR`, `OMNIVOICE_REFERENCE`, `OMNIVOICE_GPU_BIN`,
-`OMNIVOICE_GPU_MODEL`, and `OMNIVOICE_GPU_CODEC`. Measurements are in
-`data/benchmarks/ru-reply-compare/`.
+`OMNIVOICE_GPU_MODEL`, and `OMNIVOICE_GPU_CODEC`.
 
 Compose builds the separate CPU inference environment and mounts local model/voice
 assets read-only, with an 8 GiB assistant limit. Run the setup script before
 building/starting Compose. The host service uses its existing model environment.
 
-Legacy `kitten`, `kitten-mini`, and `pocket` backends remain explicitly selectable.
-Kitten setup is `./host/setup-kitten.sh`; its full model uses `expressive` and
-disables normalization for Russian. See [Kitten measurements](docs/kitten-tts-2.md).
-
-The [audio.cpp CPU trial](docs/audio-cpp-kitten-tts-2.md) compares the full
-Kitten TTS 2 model with the current runtime and links English/Russian emotion
-and sound samples saved locally.
-
-The [OmniVoice CPU optimization report](docs/omnivoice-cpu-optimization.md)
-records English/Russian speedups, CPU/RAM measurements and the focused listening
-comparison. The selected settings are now wired into the processor.
-
-The faster English option is **Kitten TTS Mini 80M**: run
-`./host/setup-kitten.sh mini`, set `TTS_BACKEND=kitten-mini`, then restart.
-It uses about 276–310 MiB RAM and generates the short test reply in about
-0.3 seconds (about 0.85 seconds including loading). Mini uses English phonemes;
-Russian requests continue through Pocket TTS. See [Mini measurements](docs/kitten-tts-mini.md).
-
-Powered by KittenML when a Kitten backend is selected. Kitten TTS 2 weights
-are separately licensed under the
-[Stellon Labs Community License](https://huggingface.co/KittenML/kitten-tts-2/blob/main/LICENSE.md).
-Mini 0.8 is [Apache-2.0](https://huggingface.co/KittenML/kitten-tts-mini-0.8).
+Only the configured OmniVoice backend and Whisper STT assets are retained.
+Old speech experiments, benchmark media, duplicate F32 GGUF weights and build
+intermediates have been removed. The CPU weights and environment remain because
+they provide the fallback when the GPU is busy.
 
 License: GPL-3.0, see `LICENSE`.

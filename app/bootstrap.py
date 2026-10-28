@@ -1,7 +1,7 @@
 """Local Cast OAuth-shaped bootstrap, accepted only by our offline S3 server.
 
 Wire layout comes from the Cast receiver's GoogleOauthCredential parser and
-RobotAccountAuthManager consumer. See data/research/cast-receiver/PROTOCOL.md.
+RobotAccountAuthManager consumer. See docs/cast-bootstrap.md.
 This never obtains or generates a Google access token.
 """
 

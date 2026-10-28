@@ -32,10 +32,7 @@ export TTS_DIR="$PROJECT_DIR/data/tts"
 export PROXY_CONFIG="$PROJECT_DIR/proxy-config"
 export STT_MODEL="$PROJECT_DIR/models/stt/futo.bin"
 export WHISPER_BIN="$PROJECT_DIR/bin/whisper-cli"
-export POCKET_BIN="$PROJECT_DIR/bin/pocket-tts"
 export TTS_BACKEND="${TTS_BACKEND:-omnivoice}"
-export RU_CONFIG="$PROJECT_DIR/models/ru/config.yaml"
-export RU_VOICE="$PROJECT_DIR/models/ru/voice.safetensors"
 export LISTEN_HOST=0.0.0.0
 export LISTEN_PORT=8099
 export ASSISTANT_URL="${ASSISTANT_URL:-http://127.0.0.1:8099}"
@@ -52,9 +49,7 @@ export MONITOR_PORT="${MONITOR_PORT:-53412}"
 
 if [[ "$ASSISTANT_ENABLED" == 1 ]]; then
   [[ -x "$WHISPER_BIN" ]] || { echo "missing Whisper binary" >&2; exit 1; }
-  if [[ "$TTS_BACKEND" == pocket ]]; then
-    [[ -x "$POCKET_BIN" ]] || { echo "missing Pocket TTS binary" >&2; exit 1; }
-  fi
+  [[ "$TTS_BACKEND" == omnivoice ]] || { echo "unsupported TTS_BACKEND: $TTS_BACKEND (use omnivoice)" >&2; exit 1; }
   if [[ "$TTS_BACKEND" == omnivoice ]]; then
     omnivoice_python="${OMNIVOICE_PYTHON:-$PROJECT_DIR/models/omnivoice-env/bin/python}"
     [[ -x "$omnivoice_python" ]] || {

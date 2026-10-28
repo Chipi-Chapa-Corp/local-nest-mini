@@ -74,7 +74,7 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(self.api.requests[0]["body"]["reasoning_effort"], "low")
 
     def test_prompt_asks_for_plain_speech_without_sound_tags(self):
-        for backend in ("omnivoice", "kitten"):
+        for backend in ("omnivoice",):
             with self.subTest(backend=backend), patch.dict(os.environ, {"TTS_BACKEND": backend}):
                 processor.respond("Hello")
                 prompt = self.api.requests[-1]["body"]["messages"][0]["content"]

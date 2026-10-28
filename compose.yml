@@ -43,9 +43,6 @@ services:
       TTS_DIR: /data/tts
       STT_MODEL: /app/models/stt/futo.bin
       WHISPER_BIN: /usr/local/bin/whisper-cli
-      POCKET_BIN: /usr/local/bin/pocket-tts
-      RU_CONFIG: /app/models/ru/config.yaml
-      RU_VOICE: /app/models/voices/ru.safetensors
       LISTEN_HOST: 0.0.0.0
       LISTEN_PORT: "8099"
       STT_THREADS: "6"

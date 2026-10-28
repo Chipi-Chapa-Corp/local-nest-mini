@@ -104,7 +104,7 @@ def recording_stop(elapsed_us):
 
     The published Assistant library's ProcessEndpointerEvent dispatches 1/3
     to onSpeechEnd and ignores 2. The working Nest capture sends 3, 1, then 2.
-    See data/research/assistant-library/PROTOCOL.md for the static analysis.
+    See docs/assistant-protocol.md for the static analysis.
     Live check 19:09:04: the Nest stopped uploading immediately after this.
     """
     event = _field(1, 3) + _field(2, elapsed_us) + _field(3, elapsed_us)

@@ -1,15 +1,13 @@
 """Backend selection, reporting, and cancellation without loading speech models."""
 
 import json
-from argparse import Namespace
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
-from app.kitten_tts import _generate
 from app.omnivoice_tts import generation_options
 
 with tempfile.TemporaryDirectory() as import_dir:
@@ -27,7 +25,7 @@ class TTSTests(unittest.TestCase):
         self.store = TaskStore()
         # The real machine may have a usable GPU; tests opt into the GPU path explicitly.
         for name, value in {"TTS_DIR": self.root, "TASKS": self.store,
-                            "TTS_BACKEND": "kitten", "OMNIVOICE_GPU": "off"}.items():
+                            "TTS_BACKEND": "omnivoice", "OMNIVOICE_GPU": "off"}.items():
             p = patch.object(server, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -38,63 +36,6 @@ class TTSTests(unittest.TestCase):
         report = {"load_seconds": 2, "generation_seconds": 10, "peak_rss_mib": 2300}
         return subprocess.CompletedProcess(command, 0, json.dumps(report).encode(), b"")
 
-    def test_kitten_selects_russian_voice_and_keeps_metrics(self):
-        task = self.store.create()
-        with patch.object(server, "_kitten_ready", return_value=True), \
-             patch.object(server, "_run", side_effect=self.generate) as run:
-            output = server.synthesize("Привет", "auto", task["id"])
-        command = list(map(str, run.call_args.args[0]))
-        self.assertEqual(command[command.index("--voice") + 1], "Russian")
-        self.assertEqual(command[command.index("--lang") + 1], "ru")
-        self.assertNotIn("--download", command)
-        self.assertTrue(output.is_file())
-        details = self.store.get(task["id"])["stages"][0]["detail"]
-        self.assertEqual(details["engine"], "Kitten TTS 2")
-        self.assertEqual(details["metrics"]["peak_rss_mib"], 2300)
-
-    def test_full_kitten_handles_both_languages_without_pocket(self):
-        with patch.object(server, "_kitten_ready", return_value=True), \
-             patch.object(server, "_run", side_effect=self.generate) as run:
-            for text, lang, voice in (("Hello", "en", "Bruno"), ("Привет", "ru", "Russian")):
-                with self.subTest(lang=lang):
-                    server.synthesize(text, lang)
-                    command = list(map(str, run.call_args.args[0]))
-                    self.assertEqual(command[0], str(server.KITTEN_PYTHON))
-                    self.assertEqual(command[command.index("--family") + 1], "2")
-                    self.assertEqual(command[command.index("--voice") + 1], voice)
-                    self.assertNotIn(str(server.POCKET_BIN), command)
-
-    def test_model_failure_removes_partial_output_and_releases_lock(self):
-        def fail(command, **kwargs):
-            command = list(map(str, command))
-            Path(command[command.index("--output") + 1]).write_bytes(b"partial")
-            return subprocess.CompletedProcess(command, 1, b"", b"decoder failed")
-        with patch.object(server, "_kitten_ready", return_value=True), \
-             patch.object(server, "_run", side_effect=fail):
-            with self.assertRaisesRegex(RuntimeError, "decoder failed"):
-                server.synthesize("Hello")
-        self.assertFalse(list(self.root.glob("*.wav")))
-        self.assertFalse(server.KITTEN_LOCK.locked())
-
-    def test_cancelled_task_does_not_start_kitten(self):
-        task = self.store.create()
-        self.store.cancel(task["id"])
-        with patch.object(server, "_kitten_ready", return_value=True), \
-             patch.object(server, "_run") as run:
-            with self.assertRaises(TaskCancelled):
-                server.synthesize("Hello", task_id=task["id"])
-        run.assert_not_called()
-        self.assertFalse(server.KITTEN_LOCK.locked())
-
-    def test_pocket_remains_available(self):
-        def generate(command, **kwargs):
-            command = list(map(str, command))
-            Path(command[command.index("--output-path") + 1]).write_bytes(b"RIFF")
-            return subprocess.CompletedProcess(command, 0, b"", b"")
-        with patch.object(server, "TTS_BACKEND", "pocket"), \
-             patch.object(server, "_run", side_effect=generate) as run:
-            self.assertTrue(server.synthesize("Hello").is_file())
-        self.assertEqual(run.call_args.args[0][1], "generate")
 
     def test_omnivoice_routes_both_languages_with_selected_settings(self):
         with patch.object(server, "TTS_BACKEND", "omnivoice"), \
@@ -236,32 +177,6 @@ class TTSTests(unittest.TestCase):
         self.assertEqual(server._gpu_free_vram_mib(root), 16368 - 2148)
         self.assertIsNone(server._gpu_free_vram_mib(self.root / "empty"))
 
-    def test_mini_selects_onnx_worker_for_english(self):
-        with patch.object(server, "TTS_BACKEND", "kitten-mini"), \
-             patch.object(server, "_kitten_ready", return_value=True), \
-             patch.object(server, "_run", side_effect=self.generate) as run:
-            output = server.synthesize("Hello")
-        command = list(map(str, run.call_args.args[0]))
-        self.assertEqual(command[command.index("--family") + 1], "mini")
-        self.assertEqual(command[0], str(server.KITTEN_MINI_PYTHON))
-        self.assertTrue(output.is_file())
-
-    def test_mini_keeps_pocket_for_russian(self):
-        task = self.store.create()
-        config, voice = self.root / "ru.yaml", self.root / "voice.safetensors"
-        config.write_text("fixture")
-        voice.write_bytes(b"fixture")
-        def generate(command, **kwargs):
-            command = list(map(str, command))
-            Path(command[command.index("--output-path") + 1]).write_bytes(b"RIFF")
-            return subprocess.CompletedProcess(command, 0, b"", b"")
-        with patch.object(server, "TTS_BACKEND", "kitten-mini"), \
-             patch.object(server, "RU_CONFIG", config), \
-             patch.object(server, "RU_VOICE", voice), \
-             patch.object(server, "_run", side_effect=generate) as run:
-            server.synthesize("Привет", "auto", task["id"])
-        self.assertIn("--config", run.call_args.args[0])
-        self.assertEqual(self.store.get(task["id"])["stages"][0]["detail"]["engine"], "Pocket TTS")
 
     def test_cancellation_terminates_a_just_started_subprocess(self):
         task = self.store.create()
@@ -278,29 +193,6 @@ class TTSTests(unittest.TestCase):
         stop.assert_called_once()
         self.assertIsNotNone(stop.call_args.args[0].poll())
         self.assertFalse(self.store._procs.get(task["id"]))
-
-
-class KittenWorkerTests(unittest.TestCase):
-    def test_expressive_generation_and_russian_normalization(self):
-        for lang, text, normalize in (("en", "Hello", True), ("ru", "Привет", False),
-                                      ("auto", "[joyful] Привет", False),
-                                      ("auto", "Hello", True), ("ru", "123", False)):
-            with self.subTest(lang=lang, text=text):
-                model = Mock()
-                args = Namespace(family="2", text=text, output=Path("reply.wav"),
-                                 voice="Russian" if not normalize else "Bruno", lang=lang)
-                _generate(model, args)
-                options = model.generate_to_file.call_args.kwargs
-                self.assertEqual(options["preset"], "expressive")
-                self.assertEqual(options["normalize"], normalize)
-                self.assertEqual(model.generate_to_file.call_args.args[0], text)
-
-    def test_mini_uses_its_supported_generation_options(self):
-        model = Mock()
-        args = Namespace(family="mini", text="Hello", output=Path("reply.wav"),
-                         voice="Bruno", lang="en")
-        _generate(model, args)
-        model.generate_to_file.assert_called_once_with("Hello", Path("reply.wav"), voice="Bruno")
 
 
 class OmniVoiceWorkerTests(unittest.TestCase):

@@ -29,9 +29,6 @@ fi
 git -C "$SRC" submodule update --init --recursive
 
 cmake_bin="$(command -v cmake || true)"
-if [[ -z "$cmake_bin" ]]; then
-  cmake_bin="$(ls models/audio-cpp-tools/lib/python3.*/site-packages/cmake/data/bin/cmake 2>/dev/null | head -1 || true)"
-fi
 [[ -n "$cmake_bin" ]] || { echo "cmake is required (e.g. dnf install cmake)" >&2; exit 1; }
 command -v glslc >/dev/null || { echo "glslc is required (dnf install glslc)" >&2; exit 1; }
 

@@ -39,16 +39,12 @@ snapshot_download(MODEL, revision=REVISION, local_dir=str(root/'models/omnivoice
 PY
 mkdir -p models/omnivoice-voices
 if [[ ! -s models/omnivoice-voices/laylo-en.wav ]]; then
-  if [[ -s data/benchmarks/omnivoice/sound-suite/approved-en-reference.wav ]]; then
-    cp data/benchmarks/omnivoice/sound-suite/approved-en-reference.wav models/omnivoice-voices/laylo-en.wav
-  else
-    # Bootstrap a synthetic reference when no approved audition exists locally.
-    models/omnivoice-env/bin/python app/omnivoice_tts.py \
-      --model-dir models/omnivoice --reference models/omnivoice-voices/laylo-en.wav \
-      --bootstrap-reference \
-      --text 'We finally made breakfast without burning the toast.' --lang en --steps 32 \
-      --output models/omnivoice-voices/laylo-en.wav
-  fi
+  # Bootstrap a synthetic reference only when the saved voice is absent.
+  models/omnivoice-env/bin/python app/omnivoice_tts.py \
+    --model-dir models/omnivoice --reference models/omnivoice-voices/laylo-en.wav \
+    --bootstrap-reference \
+    --text 'We finally made breakfast without burning the toast.' --lang en --steps 32 \
+    --output models/omnivoice-voices/laylo-en.wav
 fi
 models/omnivoice-env/bin/python -I -c 'import numpy, torch, torchaudio; from omnivoice import OmniVoice'
 models/omnivoice-env/bin/python -m pip check

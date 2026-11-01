@@ -9,9 +9,10 @@ import urllib.error
 import urllib.request
 import wave
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from app.monitor import start_monitor
+from app.processor import respond
 from app.tasks import TaskStore
 from app.test_pipeline import TestPipeline
 
@@ -90,6 +91,39 @@ class MonitorTests(unittest.TestCase):
     def test_russian_input_selects_russian_tts(self):
         self.ready("Привет")
         self.assertEqual(self.synthesize.call_args.args[1], "ru")
+
+    def test_generation_failure_produces_playable_russian_error(self):
+        self.tests.respond = respond
+        with patch("app.processor.urlopen", side_effect=TimeoutError), \
+             patch.dict("os.environ", {"LLM_BASE_URL": "http://localhost:8000/v1", "LLM_MODEL": "test"}):
+            task_id = self.ready("Hello")
+        task = self.store.get(task_id)
+        reply = ("Не получилось сгенерировать ответ. Диктую ошибку: "
+                 "LLM API request failed or timed out")
+        self.assertEqual(task["stages"][2]["detail"]["response"], reply)
+        self.assertIsNone(task["error"])
+        self.synthesize.assert_called_once_with(reply, "ru", task_id)
+        self.assertEqual(self.request(f"/api/tests/{task_id}/audio")[0], 200)
+        self.request(f"/api/tests/{task_id}/cast", b"")
+        self.wait_for(task_id, "done")
+        self.player.play.assert_called_once_with("http://local/tts/reply.wav", task_id)
+
+    def test_stage_timing_excludes_waiting_and_keeps_loading_updates(self):
+        task_id = self.create()
+        with patch("app.tasks.now", return_value=10):
+            self.store.stage(task_id, "output", "waiting")
+        with patch("app.tasks.now", return_value=20):
+            self.store.start(task_id, "output")
+        with patch("app.tasks.now", return_value=21):
+            self.store.start(task_id, "output", transport="cast")
+        with patch("app.tasks.now", return_value=23):
+            stage = self.store.finish(task_id, "output")
+        self.assertEqual((stage["started"], stage["ended"]), (20, 23))
+        with patch("app.tasks.now", return_value=30):
+            self.store.start(task_id, "output")
+        with patch("app.tasks.now", return_value=32):
+            stage = self.store.finish(task_id, "output")
+        self.assertEqual((stage["started"], stage["ended"]), (30, 32))
 
     def test_cast_failure_keeps_browser_playback_available(self):
         task_id = self.ready()

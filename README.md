@@ -64,12 +64,14 @@ The monitor’s **Test** button creates a browser test pipeline. Click the micro
 to record, then stop to transcribe and generate a reply. At the final step,
 choose **Cast to Nest** or **Play** in the browser. Microphone recording requires
 localhost or HTTPS; recordings stop automatically after 60 seconds.
+Each pipeline step shows its elapsed time, updating while it runs.
 
 The processor sends the transcript and Laylo's voice instructions to the configured
 API's `/chat/completions` endpoint, then passes the assistant's reply to local TTS
 and the selected playback transport. Each request is a fresh conversation. STT
-and TTS remain local; transcripts go to your configured LLM provider. API failures
-fail the processing stage without generating fallback speech.
+and TTS remain local; transcripts go to your configured LLM provider. If generation
+fails, the reply becomes “Не получилось сгенерировать ответ. Диктую ошибку: …”
+with the error message, and continues through TTS and playback.
 
 LLM and local assistant HTTP requests allow five minutes (300 seconds) per
 request; `/answer` includes both LLM generation and TTS. Whisper inference also allows five minutes. OmniVoice retains its internal

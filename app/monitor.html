@@ -60,6 +60,8 @@ button:focus-visible,summary:focus-visible{outline:2px solid var(--a2);outline-o
 .error .node{color:var(--bad);background:rgba(242,122,138,.08)}.waiting .node{color:var(--a2)}
 .step.recording .node{color:var(--bad);background:rgba(242,122,138,.08)}
 .label{min-width:0;padding-top:3px;font-size:14px;color:var(--text);overflow-wrap:anywhere}
+.step-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+.duration{flex:none;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
 .pending .label,.skipped .label{color:var(--faint)}.error .label{color:var(--bad)}
 .label q{color:var(--muted)}.label q::before,.label q::after{content:'"'}
 .err{margin-top:14px;padding:10px 14px;border-radius:12px;background:rgba(242,122,138,.1);color:var(--bad);font-size:14px;overflow-wrap:anywhere}
@@ -114,7 +116,7 @@ const MAX_RECORDING_MS=60000;
 function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 function q(text){const t=String(text??""),s=t.length>70?t.slice(0,68).trimEnd()+"…":t;return `<q title="${esc(t)}">${esc(s)}</q>`}
 function clock(ts){return new Date(ts*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"})}
-function secs(a,b){return a&&b?`${(b-a).toFixed(1)} s`:""}
+function secs(a,b){return Number.isFinite(a)&&Number.isFinite(b)?`${Math.max(0,b-a).toFixed(1)} s`:""}
 
 function steps(task){
   const by=Object.fromEntries((task.stages||[]).map(s=>[s.name,s]));
@@ -157,7 +159,8 @@ function steps(task){
       if(playing)label="Playing in browser…";
       if(out.last_error)controls+=`<div class="notice" role="status">${esc(out.last_error)}</div>`;
     }
-    return {cls,label,controls,glyph:cls==="loading"?"loader-circle":glyph};
+    const duration=st&&st.status!=="skipped"?secs(st.started,st.ended??Date.now()/1000):"";
+    return {cls,label,controls,duration,glyph:cls==="loading"?"loader-circle":glyph};
   });
 }
 
@@ -167,7 +170,7 @@ function renderTasks(tasks=state.tasks){
   const shown=state.showAll?tasks:tasks.slice(0,5);
   $("tasks").innerHTML=shown.map(task=>{
     const test=task.meta?.source==="browser_test";
-    const flow=steps(task).map(s=>`<div class="step ${s.cls}"><div class="node">${icon(s.glyph)}</div><div class="step-content"><div class="label">${s.label}</div>${s.controls}</div></div>`).join("");
+    const flow=steps(task).map(s=>`<div class="step ${s.cls}"><div class="node">${icon(s.glyph)}</div><div class="step-content"><div class="step-heading"><div class="label">${s.label}</div>${s.duration?`<span class="duration" aria-label="Step duration">${s.duration}</span>`:""}</div>${s.controls}</div></div>`).join("");
     const end=["done","error","interrupted"].includes(task.status)?secs(task.created,task.updated):"";
     const stop=["loading","waiting"].includes(task.status)?`<button class="icon" title="Interrupt" aria-label="Interrupt pipeline" data-stop="${esc(task.id)}">${icon("square")}</button>`:"";
     const err=task.error?`<div class="err" role="status">${esc(task.error.message)}</div>`:"";
@@ -286,7 +289,7 @@ async function refresh(){
   try{
     const [t,r]=await Promise.all([fetch("api/tasks").then(x=>x.json()),fetch("api/requests").then(x=>x.json())]);
     const ts=JSON.stringify(t.tasks),rs=JSON.stringify(r.requests);
-    if(ts!==state.last.tasks){state.last.tasks=ts;renderTasks(t.tasks||[])}
+    if(ts!==state.last.tasks||state.tasks.some(t=>(t.stages||[]).some(s=>s.status==="loading"))){state.last.tasks=ts;renderTasks(t.tasks||[])}
     if(rs!==state.last.requests){state.last.requests=rs;renderRequests(r.requests||[])}
     setStatus(state.paused?"":"live",state.paused?"Paused":"Live");
   }catch{setStatus("down","Disconnected")}

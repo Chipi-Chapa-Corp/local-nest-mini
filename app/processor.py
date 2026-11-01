@@ -6,6 +6,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from .tasks import TaskCancelled
+
 
 SYSTEM_PROMPT = """# You
 You are a voice assistant named Laylo (pronounced "lejlo"). Respond quickly, briefly, and write only text suitable for speaking aloud.
@@ -25,6 +27,16 @@ def respond(text: str) -> str:
     text = (text or "").strip()
     if not text:
         raise ValueError("input must not be empty")
+    try:
+        return _request_response(text)
+    except TaskCancelled:
+        raise
+    except Exception as exc:
+        error = str(exc).strip() or type(exc).__name__
+        return f"Не получилось сгенерировать ответ. Диктую ошибку: {error}"
+
+
+def _request_response(text: str) -> str:
     base_url = os.environ.get("LLM_BASE_URL", "").strip().rstrip("/")
     model = os.environ.get("LLM_MODEL", "").strip()
     if not base_url or not model:

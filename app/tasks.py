@@ -92,6 +92,9 @@ class TaskStore:
             if stage is None:
                 stage = {"name": name, "status": status, "started": stamp, "ended": None, "detail": {}}
                 task["stages"].append(stage)
+            elif status == "loading" and stage["status"] != "loading":
+                # A new attempt starts now; exclude time spent waiting for user input.
+                stage["started"] = stamp
             stage["status"] = status
             stage["detail"].update(detail)
             if status == "loading":

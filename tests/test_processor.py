@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 from urllib.request import Request, urlopen
 
 from app import processor
-from app.tasks import TaskStore
+from app.tasks import TaskCancelled, TaskStore
 
 
 class FakeAPI(BaseHTTPRequestHandler):
@@ -88,36 +88,54 @@ class ProcessorTests(unittest.TestCase):
             processor.respond("  ")
         for name in ("LLM_BASE_URL", "LLM_MODEL"):
             with self.subTest(name=name), patch.dict(os.environ, {name: ""}):
-                with self.assertRaisesRegex(RuntimeError, "must be configured"):
-                    processor.respond("Hello")
+                self.assertEqual(processor.respond("Hello"),
+                                 "Не получилось сгенерировать ответ. Диктую ошибку: "
+                                 "LLM_BASE_URL and LLM_MODEL must be configured")
         self.assertEqual(self.api.requests, [])
 
     def test_invalid_base_url(self):
         with patch.dict(os.environ, {"LLM_BASE_URL": "file:///tmp/llm"}):
-            with self.assertRaisesRegex(RuntimeError, "HTTP\\(S\\)"):
-                processor.respond("Hello")
+            self.assertIn("Диктую ошибку: LLM_BASE_URL must be an HTTP(S) API base URL",
+                          processor.respond("Hello"))
 
     def test_api_failure_does_not_expose_provider_body(self):
         self.api.status = 401
         self.api.body = b"private provider error"
-        with self.assertRaisesRegex(RuntimeError, "^LLM API returned HTTP 401$"):
-            processor.respond("Hello")
+        self.assertEqual(processor.respond("Hello"),
+                         "Не получилось сгенерировать ответ. Диктую ошибку: LLM API returned HTTP 401")
 
-    def test_invalid_and_empty_responses_fail(self):
+    def test_invalid_and_empty_responses_become_spoken_errors(self):
         for body in (b"not json", b"{}", b"null", b'{"choices": []}',
                      b'{"choices": [{"message": {"content": null}}]}',
                      b'{"choices": [{"message": {"content": "  "}}]}'):
             with self.subTest(body=body):
                 self.api.body = body
-                with self.assertRaisesRegex(RuntimeError, "LLM API returned"):
-                    processor.respond("Hello")
+                self.assertTrue(processor.respond("Hello").startswith(
+                    "Не получилось сгенерировать ответ. Диктую ошибку: LLM API returned"))
 
-    def test_timeout_is_a_processing_error(self):
+    def test_timeout_becomes_a_spoken_error(self):
         with patch.object(processor, "urlopen", side_effect=TimeoutError):
-            with self.assertRaisesRegex(RuntimeError, "timed out"):
+            self.assertEqual(processor.respond("Hello"),
+                             "Не получилось сгенерировать ответ. Диктую ошибку: "
+                             "LLM API request failed or timed out")
+
+    def test_cancellation_is_not_spoken(self):
+        with patch.object(processor, "urlopen", side_effect=TaskCancelled("task interrupted")):
+            with self.assertRaises(TaskCancelled):
                 processor.respond("Hello")
 
     def test_api_reply_reaches_tts_and_playback(self):
+        self.assert_reply_reaches_playback(self.reply)
+
+    def test_api_failure_reaches_tts_and_playback(self):
+        self.api.status = 503
+        self.api.body = b"private provider error"
+        reply = "Не получилось сгенерировать ответ. Диктую ошибку: LLM API returned HTTP 503"
+        for path in ("/answer", "/turn"):
+            with self.subTest(path=path):
+                self.assert_reply_reaches_playback(reply, path)
+
+    def assert_reply_reaches_playback(self, reply, path="/answer"):
         with tempfile.TemporaryDirectory() as temp:
             with patch.dict(os.environ, {"DATA_DIR": temp}):
                 from app import server
@@ -132,15 +150,18 @@ class ProcessorTests(unittest.TestCase):
             player.play.return_value = {"played": True}
             store = TaskStore()
             with patch.object(server, "TASKS", store), \
+                 patch.object(server, "DATA_DIR", Path(temp)), \
                  patch.object(server, "OUTPUT_MODE", "cast"), \
+                 patch.object(server, "transcribe_audio", return_value="Привет"), \
                  patch.object(server, "synthesize", return_value=audio) as synthesize, \
                  patch.object(server, "PLAYER", player):
                 http = ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
                 thread = threading.Thread(target=http.serve_forever, daemon=True)
                 thread.start()
                 try:
-                    req = Request(f"http://127.0.0.1:{http.server_port}/answer",
-                                  data=json.dumps({"text": "Привет", "play": True}).encode(),
+                    req = Request(f"http://127.0.0.1:{http.server_port}{path}?play=1",
+                                  data=(b"recorded audio" if path == "/turn" else
+                                        json.dumps({"text": "Привет", "play": True}).encode()),
                                   headers={"Content-Type": "application/json"})
                     with urlopen(req, timeout=3) as response:
                         result = json.load(response)
@@ -148,8 +169,8 @@ class ProcessorTests(unittest.TestCase):
                     http.shutdown()
                     http.server_close()
                     thread.join()
-            self.assertEqual(result["response"], self.reply)
-            synthesize.assert_called_once_with(self.reply, "auto", result["task_id"])
+            self.assertEqual(result["response"], reply)
+            synthesize.assert_called_once_with(reply, "auto", result["task_id"])
             player.play.assert_called_once_with(result["audio_url"], result["task_id"])
             self.assertEqual(store.get(result["task_id"])["status"], "done")
 

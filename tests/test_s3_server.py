@@ -10,17 +10,21 @@ from h2.connection import H2Connection
 from h2.events import DataReceived, StreamEnded, TrailersReceived
 
 from app import s3_server
+from app.control import AssistantControl
 from app.native import _field, _frame, _frames, _fields
 
 
 class S3TransportTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        self.control = AssistantControl(Path(self.temp.name) / "assistant-silenced")
+        self.wake = _frame(_field(62724734, _field(1, b"fLaCwake")))
         self.patchers = [
             patch.object(s3_server, "DATA_DIR", Path(self.temp.name)),
             patch.object(s3_server, "SILENCE", 0.03),
             patch.object(s3_server, "log"),
             patch.object(s3_server, "_finish_output"),
+            patch.object(s3_server, "CONTROL", self.control),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -74,7 +78,7 @@ class S3TransportTest(unittest.IsolatedAsyncioTestCase):
         self.writer.write(self.client.data_to_send())
         await asyncio.sleep(0.08)
         audio = b"fLaC" + bytes(16)
-        request = _frame(_field(293101, _field(1, audio))) + _frame(_field(3, 1))
+        request = self.wake + _frame(_field(293101, _field(1, audio))) + _frame(_field(3, 1))
         expected = bytes(range(256)) * 700
         with patch.object(s3_server, "_run_query", return_value=("test", expected, {})) as query:
             self.client.send_data(1, request, end_stream=False)
@@ -108,7 +112,7 @@ class S3TransportTest(unittest.IsolatedAsyncioTestCase):
         query.assert_not_called()
 
     async def test_model_failure_returns_grpc_error(self):
-        request = _frame(_field(293101, _field(1, b"fLaC" + bytes(16))))
+        request = self.wake + _frame(_field(293101, _field(1, b"fLaC" + bytes(16))))
         with patch.object(s3_server, "_run_query", side_effect=RuntimeError("model failed")):
             self.client.send_data(1, request, end_stream=True)
             self.writer.write(self.client.data_to_send())
@@ -125,7 +129,7 @@ class S3TransportTest(unittest.IsolatedAsyncioTestCase):
             return "test", b"native-reply", {}
         try:
             with patch.object(s3_server, "_run_query", side_effect=generate):
-                self.client.send_data(1, _frame(initial) + audio + _frame(_field(3, 1)))
+                self.client.send_data(1, _frame(initial) + self.wake + audio + _frame(_field(3, 1)))
                 self.writer.write(self.client.data_to_send())
                 await asyncio.sleep(.6)
                 gate.set()
@@ -142,7 +146,7 @@ class S3TransportTest(unittest.IsolatedAsyncioTestCase):
             entered.set()
             release.wait(2)
             return "test", b"reply", {}
-        request = _frame(_field(293101, _field(1, b"fLaC" + bytes(16))))
+        request = self.wake + _frame(_field(293101, _field(1, b"fLaC" + bytes(16))))
         try:
             with patch.object(s3_server, "_run_query", side_effect=generate), \
                  patch.object(s3_server, "_cancel_query", side_effect=lambda task_id: cancelled.set()) as cancel:
@@ -158,7 +162,7 @@ class S3TransportTest(unittest.IsolatedAsyncioTestCase):
             release.set()
 
     async def test_disconnect_after_delivery_does_not_cancel_success(self):
-        request = _frame(_field(293101, _field(1, b"fLaC" + bytes(16))))
+        request = self.wake + _frame(_field(293101, _field(1, b"fLaC" + bytes(16))))
         updating, release = threading.Event(), threading.Event()
         def finish(*args):
             updating.set()
@@ -196,7 +200,7 @@ class S3TransportTest(unittest.IsolatedAsyncioTestCase):
         heartbeat = next(v for f, w, v in fields if f == 29737259 and w == 2)
         self.assertEqual(_fields(heartbeat)[0], (1, 0, 0))
         audio = b"fLaC" + bytes(16)
-        request = _frame(_field(293101, _field(1, audio))) + _frame(_field(3, 1))
+        request = self.wake + _frame(_field(293101, _field(1, audio))) + _frame(_field(3, 1))
         with patch.object(s3_server, "_run_query", return_value=("test", b"reply", {})):
             self.client.send_data(1, request)
             self.writer.write(self.client.data_to_send())
@@ -228,7 +232,7 @@ class S3TransportTest(unittest.IsolatedAsyncioTestCase):
                           return_value=(s3_server.endpoint.SPEECH_END, 1.5)), \
              patch.object(s3_server, "_run_query", return_value=("test", b"native-reply", {})) as query:
             # The device keeps its upload open, as the live Nest does.
-            self.client.send_data(1, _frame(_field(1, b"assistant")) + audio)
+            self.client.send_data(1, _frame(_field(1, b"assistant")) + self.wake + audio)
             self.writer.write(self.client.data_to_send())
             body, trailers = await self.read_response()
         self.assertEqual(self.stop_events(body)[-1], 3)
@@ -236,24 +240,76 @@ class S3TransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertLess(body.rindex(_field(1, 3)), body.rindex(b"native-reply"))
         self.assertEqual(trailers[b"grpc-status"], b"0")
         query.assert_called_once()
-        self.assertTrue(query.call_args.args[-1], "turn without hotword audio is a follow-on")
+        self.assertFalse(query.call_args.args[-1], "a fresh hotword turn is processed normally")
 
-    async def test_follow_on_without_speech_closes_quietly(self):
+    async def test_follow_on_closes_before_upload_end_without_any_inference(self):
         template = Path(self.temp.name) / "nospeech.bin"
         template.write_bytes(_frame(_field(124211619, _field(1, 1))))
         audio = _frame(_field(293101, _field(1, b"fLaC" + bytes(16))))
         with patch.object(s3_server, "NO_SPEECH_TEMPLATE", template), \
              patch.object(s3_server, "SILENCE", 30), \
-             patch.object(s3_server.endpoint, "decode_pcm", return_value=b""), \
-             patch.object(s3_server.endpoint, "decide",
-                          return_value=(s3_server.endpoint.NO_SPEECH_DETECTED, 5.0)), \
+             patch.object(s3_server.endpoint, "decode_pcm") as decode, \
+             patch.object(s3_server, "_assistant") as assistant, \
              patch.object(s3_server, "_run_query") as query:
             self.client.send_data(1, _frame(_field(1, b"assistant")) + audio)
             self.writer.write(self.client.data_to_send())
             body, trailers = await self.read_response()
+        self.assertEqual(body, template.read_bytes())
+        decode.assert_not_called()
+        assistant.assert_not_called()
         self.assertTrue(body.endswith(template.read_bytes()))
         self.assertEqual(trailers[b"grpc-status"], b"0")
         query.assert_not_called()
+
+    async def test_fresh_hotword_after_follow_on_works_on_same_connection(self):
+        template = Path(self.temp.name) / "nospeech.bin"
+        template.write_bytes(_frame(_field(124211619, _field(1, 1))))
+        query_audio = _frame(_field(293101, _field(1, b"fLaC" + bytes(16))))
+        with patch.object(s3_server, "NO_SPEECH_TEMPLATE", template), \
+             patch.object(s3_server, "_run_query", return_value=("test", b"fresh-reply", {})) as query:
+            self.client.send_data(1, _frame(_field(1, b"assistant")) + query_audio)
+            self.writer.write(self.client.data_to_send())
+            body, trailers = await self.read_response()
+            self.assertEqual(body, template.read_bytes())
+            query.assert_not_called()
+            self.client.end_stream(1)
+            self.client.send_headers(3, [
+                (":method", "POST"), (":scheme", "https"),
+                (":authority", s3_server.S3_HOST),
+                (":path", "/speech.s3.S3StubbyClientConnectorService/S3Bidi"),
+                ("content-type", "application/grpc"),
+            ])
+            self.client.send_data(3, _frame(_field(1, b"assistant")) + self.wake
+                                  + query_audio + _frame(_field(3, 1)), end_stream=True)
+            self.writer.write(self.client.data_to_send())
+            body, trailers = await self.read_response()
+        self.assertTrue(body.endswith(b"fresh-reply"))
+        self.assertEqual(trailers[b"grpc-status"], b"0")
+        query.assert_called_once()
+
+    async def test_fragmented_hotword_is_not_rejected_before_query_audio(self):
+        with patch.object(s3_server, "_run_query", return_value=("test", b"fresh-reply", {})) as query:
+            self.client.send_data(1, _frame(_field(1, b"assistant")) + self.wake[:8])
+            self.writer.write(self.client.data_to_send())
+            await asyncio.sleep(.06)
+            query.assert_not_called()
+            self.client.send_data(1, self.wake[8:])
+            self.writer.write(self.client.data_to_send())
+            # Receiving only hotword audio must not trigger the query debounce.
+            await asyncio.sleep(.06)
+            self.assertFalse(any(c.args[0] == "s3_quiet_close" for c in s3_server.log.call_args_list))
+            self.client.send_data(1, _frame(_field(293101, _field(1, b"fLaC" + bytes(16))))
+                                  + _frame(_field(3, 1)), end_stream=True)
+            self.writer.write(self.client.data_to_send())
+            body, trailers = await self.read_response()
+        self.assertTrue(body.endswith(b"fresh-reply"))
+        self.assertEqual(trailers[b"grpc-status"], b"0")
+        query.assert_called_once()
+
+    def test_follow_on_worker_guard_skips_transcription(self):
+        with patch.object(s3_server, "_assistant") as assistant:
+            self.assertIsNone(s3_server._prepare_query(b"audio", "task", 5, [5], 0, follow_on=True))
+        assistant.assert_not_called()
 
     async def test_empty_transcript_closes_quietly_instead_of_empty_reply(self):
         template = Path(self.temp.name) / "nospeech.bin"
@@ -269,6 +325,58 @@ class S3TransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(body.endswith(template.read_bytes()))
         self.assertEqual(trailers[b"grpc-status"], b"0")
         self.assertFalse(query.call_args.args[-1], "hotword turn is not a follow-on")
+
+    async def test_silenced_turns_reply_before_audio_and_resume_on_same_connection(self):
+        template = Path(self.temp.name) / "nospeech.bin"
+        quiet = _frame(_field(124211619, _field(1, 1)))
+        template.write_bytes(quiet)
+        self.control.set_silenced(True)
+        with patch.object(s3_server, "NO_SPEECH_TEMPLATE", template), \
+             patch.object(s3_server, "_run_query", return_value=("test", b"reply", {})) as query:
+            for stream in (1, 3):
+                if stream != 1:
+                    self.client.send_headers(stream, [
+                        (":method", "POST"), (":scheme", "https"),
+                        (":authority", s3_server.S3_HOST),
+                        (":path", "/speech.s3.S3StubbyClientConnectorService/S3Bidi"),
+                        ("content-type", "application/grpc"),
+                    ])
+                # No audio, utterance-end frame or upload EOF: reply immediately.
+                self.client.send_data(stream, _frame(_field(1, b"assistant")))
+                self.writer.write(self.client.data_to_send())
+                body, trailers = await self.read_response()
+                self.assertEqual(body, quiet)
+                self.assertEqual(trailers[b"grpc-status"], b"0")
+                self.client.end_stream(stream)
+            query.assert_not_called()
+            self.control.set_silenced(False)
+            self.client.send_headers(5, [
+                (":method", "POST"), (":scheme", "https"),
+                (":authority", s3_server.S3_HOST),
+                (":path", "/speech.s3.S3StubbyClientConnectorService/S3Bidi"),
+                ("content-type", "application/grpc"),
+            ])
+            self.client.send_data(5, _frame(_field(1, b"assistant")) + self.wake
+                                  + _frame(_field(293101, _field(1, b"fLaC" + bytes(16))))
+                                  + _frame(_field(3, 1)), end_stream=True)
+            self.writer.write(self.client.data_to_send())
+            body, trailers = await self.read_response()
+            self.assertTrue(body.endswith(b"reply"))
+            self.assertEqual(trailers[b"grpc-status"], b"0")
+            query.assert_called_once()
+
+    async def test_silencing_preserves_settings_replies(self):
+        self.control.set_silenced(True)
+        request = _frame(_field(1, b"assistant-settings")) + _frame(_field(3, 1))
+        reply = _frame(_field(1, 1))
+        with patch.object(s3_server, "control_reply", return_value=reply), \
+             patch.object(s3_server, "_run_query") as query:
+            self.client.send_data(1, request, end_stream=True)
+            self.writer.write(self.client.data_to_send())
+            body, trailers = await self.read_response()
+        self.assertEqual(body, reply)
+        self.assertEqual(trailers[b"grpc-status"], b"0")
+        query.assert_not_called()
 
 
 if __name__ == "__main__":

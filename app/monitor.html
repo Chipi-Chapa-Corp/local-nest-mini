@@ -102,14 +102,14 @@ pre{margin:0;padding:4px 20px 16px;color:var(--muted);font:12.5px/1.55 ui-monosp
   </div>
 </header>
 <main>
-  <section><div class="section-heading"><h2>Pipelines</h2><button class="btn primary" id="test"></button></div><div id="test-notice" class="notice" role="status"></div><div id="tasks"></div></section>
+  <section><div class="section-heading"><h2>Pipelines</h2><div class="actions"><button class="btn" id="assistant-toggle" disabled>Stop assistant</button><button class="btn primary" id="test"></button></div></div><p id="assistant-hint" class="hint" role="status" hidden>Assistant stopped. New Nest requests receive an empty reply immediately. Interception stays active.</p><div id="test-notice" class="notice" role="status"></div><div id="tasks"></div></section>
   <section><h2>Recent requests</h2><div id="requests" class="card"></div></section>
 </main>
 <script>
 const $=id=>document.getElementById(id);
 function icon(name,cls=""){return `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="icons.svg#${name}"></use></svg>`}
 const LANG={en:"English",ru:"Russian"};
-const state={paused:false,showAll:false,open:new Set(),last:{},tasks:[],recording:null,starting:null,uploading:null,playing:null,messages:new Map()};
+const state={paused:false,silenced:null,switching:false,showAll:false,open:new Set(),last:{},tasks:[],recording:null,starting:null,uploading:null,playing:null,messages:new Map()};
 const player=new Audio();
 const MAX_RECORDING_MS=60000;
 
@@ -253,7 +253,7 @@ function describe(e){
     case "s3_endpoint":return e.decision==="no_speech"?"Nobody spoke, stopped listening":`You stopped speaking, stopped listening after ${e.audio} s`;
     case "s3_segments":return e.count?`Captured ${kb(e.bytes)} of audio`:null;
     case "s3_response":return `Replied ${e.text?`“${e.text}”`:"with audio"}`;
-    case "s3_quiet_close":return "Closed the turn quietly";
+    case "s3_quiet_close":return e.reason==="assistant silenced"?"Assistant stopped, sent an empty reply":"Closed the turn quietly";
     case "local_wake_only":return "Heard only the wake word";
     case "local_follow_on_noise":return `Ignored background noise “${e.text}”`;
     case "s3_query_error":return "Failed to answer: "+String(e.error||"").split("\n")[0];
@@ -284,16 +284,31 @@ function renderRequests(events){
 }
 
 function setStatus(cls,text){$("status").className="status "+cls;$("status-text").textContent=text}
+function renderAssistant(){
+  const button=$("assistant-toggle");
+  button.innerHTML=icon(state.silenced?"play":"square")+(state.silenced?"Resume assistant":"Stop assistant");
+  button.disabled=state.silenced===null||state.switching;
+  button.setAttribute("aria-pressed",String(!!state.silenced));
+  $("assistant-hint").hidden=!state.silenced;
+}
 
 async function refresh(){
   try{
-    const [t,r]=await Promise.all([fetch("api/tasks").then(x=>x.json()),fetch("api/requests").then(x=>x.json())]);
+    const [t,r,a]=await Promise.all([fetch("api/tasks").then(x=>x.json()),fetch("api/requests").then(x=>x.json()),fetch("api/assistant").then(x=>{if(!x.ok)throw new Error("Could not read assistant mode");return x.json()})]);
+    if(!state.switching){state.silenced=a.silenced;renderAssistant()}
     const ts=JSON.stringify(t.tasks),rs=JSON.stringify(r.requests);
     if(ts!==state.last.tasks||state.tasks.some(t=>(t.stages||[]).some(s=>s.status==="loading"))){state.last.tasks=ts;renderTasks(t.tasks||[])}
     if(rs!==state.last.requests){state.last.requests=rs;renderRequests(r.requests||[])}
-    setStatus(state.paused?"":"live",state.paused?"Paused":"Live");
-  }catch{setStatus("down","Disconnected")}
+    setStatus(state.paused||state.silenced?"":"live",state.paused?"Updates paused":state.silenced?"Silent":"Live");
+  }catch{state.silenced=null;renderAssistant();setStatus("down","Disconnected")}
 }
+$("assistant-toggle").onclick=async()=>{
+  if(state.silenced===null||state.switching)return;
+  state.switching=true;renderAssistant();$("test-notice").textContent="";
+  try{const a=await api("api/assistant",JSON.stringify({silenced:!state.silenced}));state.silenced=a.silenced}
+  catch(error){$("test-notice").textContent=error.message}
+  finally{state.switching=false;renderAssistant();await refresh()}
+};
 function setPause(p){state.paused=p;$("pause").innerHTML=icon(p?"play":"pause");$("pause").setAttribute("aria-label",p?"Resume updates":"Pause updates");$("pause").title=p?"Resume":"Pause";if(!p)refresh();else setStatus("","Paused")}
 $("pause").onclick=()=>setPause(!state.paused);
 $("refresh").onclick=refresh;

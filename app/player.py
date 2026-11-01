@@ -50,46 +50,82 @@ class _Player:
         except Exception:
             pass
 
-    def play(self, url: str, task_id: str | None = None):
+    def play(self, url: str, task_id: str | None = None, *, wait=False, duration=None):
         if not ENABLED:
             return {"played": False, "reason": "player disabled"}
         with self._lock:
             TASKS.check(task_id)
             try:
-                return self._play_locked(url, task_id)
+                result = self._play_locked(url, task_id)
             except TaskCancelled:
                 self.close()
                 raise
             except Exception:
                 self.close()
                 TASKS.check(task_id)
-                return self._play_locked(url, task_id)
+                result = self._play_locked(url, task_id)
+            if wait and result.get("played"):
+                try:
+                    self._wait_finished(url, task_id, duration)
+                except TaskCancelled:
+                    self._stop_media(self._cast.media_controller)
+                    raise
+            return result
+
+    def _wait_finished(self, url, task_id, duration):
+        media = self._cast.media_controller
+        deadline = time.monotonic() + max(TIMEOUT, (duration or 0) + TIMEOUT)
+        while time.monotonic() < deadline:
+            TASKS.check(task_id)
+            media.update_status()
+            if media.status.content_id and media.status.content_id != url:
+                raise RuntimeError("Cast playback was replaced")
+            if media.status.player_state == "IDLE":
+                reason = media.status.idle_reason
+                if reason in {None, "FINISHED"}:
+                    return
+                raise RuntimeError(f"Cast playback ended: {reason}")
+            time.sleep(.1)
+        self._stop_media(media)
+        raise RuntimeError("Cast playback did not finish in time")
+
+    @staticmethod
+    def _stop_media(media):
+        try:
+            media.stop(timeout=1)
+        except Exception:
+            pass
 
     def _play_locked(self, url: str, task_id: str | None = None):
         cast = self._connect()
         media = cast.media_controller
         media.play_media(url, "audio/wav")
-        seen_active = False
         state = "UNKNOWN"
         for _ in range(int(TIMEOUT / 0.25)):
             time.sleep(0.25)
             if TASKS.cancelled(task_id):
-                media.stop()
+                self._stop_media(media)
                 raise TaskCancelled("task interrupted")
             state = media.status.player_state
-            if state in {"PLAYING", "BUFFERING"}:
-                seen_active = True
+            if state in {"PLAYING", "BUFFERING"} and media.status.content_id == url:
                 break
-            if state == "IDLE" and seen_active:
+            if (state == "IDLE" and media.status.content_id == url
+                    and media.status.idle_reason == "FINISHED"):
                 break
         content_id = media.status.content_id or ""
-        if state in {"PLAYING", "BUFFERING"}:
+        if state in {"PLAYING", "BUFFERING"} and content_id == url:
             return {"played": True, "state": state, "url": url}
         if state == "IDLE" and content_id == url:
             return {"played": True, "state": state, "url": url}
         raise RuntimeError(f"Cast did not start playback: {state}")
 
     def close(self):
+        if self._cast is not None:
+            try:
+                self._cast.disconnect(timeout=1)
+            except Exception:
+                pass
+            self._cast = None
         if self._browser is not None:
             try:
                 import pychromecast

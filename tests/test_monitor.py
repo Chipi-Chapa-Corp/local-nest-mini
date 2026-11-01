@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app.monitor import start_monitor
+from app.control import AssistantControl
 from app.processor import respond
 from app.tasks import TaskStore
 from app.test_pipeline import TestPipeline
@@ -27,6 +28,7 @@ class MonitorTests(unittest.TestCase):
             wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
             wav.writeframes(b"\0\0" * 800)
         self.store = TaskStore()
+        self.control = AssistantControl(self.root / "assistant-silenced")
         self.transcribe = Mock(return_value="Hello")
         self.synthesize = Mock(return_value=self.audio)
         self.player = Mock()
@@ -39,7 +41,8 @@ class MonitorTests(unittest.TestCase):
             player=self.player, data_dir=self.root,
         )
         self.server = start_monitor(self.store, host="127.0.0.1", port=0,
-                                    log_path=self.root / "events", test_pipeline=self.tests, max_body=1000)
+                                    log_path=self.root / "events", test_pipeline=self.tests,
+                                    max_body=1000, control=self.control)
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.base = f"http://127.0.0.1:{self.server.server_port}"
@@ -183,6 +186,24 @@ class MonitorTests(unittest.TestCase):
         status, sprite = self.request("/icons.svg")
         self.assertEqual(status, 200)
         self.assertIn(b'<symbol id="mic"', sprite)
+
+    def test_stop_and_resume_are_shared_and_persisted(self):
+        self.assertEqual(json.loads(self.request("/api/assistant")[1]), {"silenced": False})
+        self.assertEqual(self.request("/api/assistant", b'{"silenced": true}')[0], 200)
+        other_process = AssistantControl(self.control.marker)
+        self.assertTrue(other_process.silenced())
+        self.assertEqual(json.loads(self.request("/api/assistant")[1]), {"silenced": True})
+        # Browser test pipelines remain usable while the Nest is silenced.
+        self.ready()
+        self.assertEqual(self.request("/api/assistant", b'{"silenced": false}')[0], 200)
+        self.assertFalse(other_process.silenced())
+
+    def test_invalid_assistant_mode_does_not_change_switch(self):
+        for body in (b'{}', b'{"silenced": "false"}', b'null', b'not json', b'\xff'):
+            with self.subTest(body=body):
+                self.assertEqual(self.request("/api/assistant", body)[0], 400)
+                self.assertFalse(self.control.silenced())
+        self.assertEqual(self.request("/api/assistant", b'x' * 1025)[0], 413)
 
 
 if __name__ == "__main__":

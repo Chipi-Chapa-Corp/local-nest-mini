@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import select
 import subprocess
 import sys
 import tempfile
@@ -156,6 +158,57 @@ fi
         imported = self.run_command(str(self.repo / "models/omnivoice-env/bin/python"),
                                     "-I", "-c", "from omnivoice import VALUE; assert VALUE == 42")
         self.assertEqual(imported.returncode, 0, imported.stderr)
+
+    def supervise_fixture(self, child_command, stop_signal=None, stop_child=False):
+        # Exercise the actual supervisor/cleanup blocks with private fixture
+        # processes. Never launch the real proxy, models or network helper.
+        source = (self.repo / 'host/service-run.sh').read_text()
+        start = source.index('assistant_pid=""')
+        end = source.index('if [[ "$ASSISTANT_ENABLED" == 1 ]]; then', start)
+        wait = source[source.index('pids=("$proxy_pid"'):]
+        script = ('set -euo pipefail\n' + source[start:end]
+                  + 'sleep 300 &\nproxy_pid=$!\n' + child_command
+                  + '\nhelper_pid=$!\nprintf "READY %s\\n" "$helper_pid"\n' + wait)
+        proc = subprocess.Popen(['bash', '-c', script], cwd=self.repo, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
+        try:
+            readable, _, _ = select.select([proc.stdout], [], [], 3)
+            self.assertTrue(readable, 'fixture did not become ready')
+            ready = proc.stdout.readline().strip()
+            self.assertTrue(ready.startswith('READY '), ready)
+            if stop_child:
+                os.kill(int(ready.split()[1]), signal.SIGTERM)
+            elif stop_signal:
+                proc.send_signal(stop_signal)
+            output, error = proc.communicate(timeout=5)
+            self.assertTrue((self.repo / 'network-helper.stop').exists())
+            return proc.returncode, output, error
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=3)
+            proc.stdout.close()
+            proc.stderr.close()
+
+    def test_supervisor_stop_signals_exit_cleanly(self):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=sig):
+                code, output, error = self.supervise_fixture('sleep 300 &', stop_signal=sig)
+                self.assertEqual(code, 0, error)
+                self.assertNotIn('a service child exited', error)
+
+    def test_supervisor_preserves_unexpected_child_failure(self):
+        code, output, error = self.supervise_fixture("bash -c 'sleep .1; exit 7' &")
+        self.assertEqual(code, 7, error)
+        self.assertIn('a service child exited with status 7', error)
+
+    def test_supervisor_does_not_mask_a_child_only_sigterm(self):
+        code, output, error = self.supervise_fixture('sleep 300 &', stop_child=True)
+        self.assertEqual(code, 143, error)
+        self.assertIn('a service child exited with status 143', error)
 
 
 if __name__ == "__main__":

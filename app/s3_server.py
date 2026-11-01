@@ -30,8 +30,9 @@ from h2.events import (
 
 from app.native import build_response, _frames, _fields, _field, _frame
 from app import endpoint
+from app.control import CONTROL
 from app.s3_audio import (extract_flac_segments, extract_query_audio, has_wake_audio,
-                          is_noise_transcript, strip_wake_word)
+                          strip_wake_word)
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 TEMPLATE = Path(os.environ.get("NATIVE_TEMPLATE", str(DATA_DIR / "native-template.bin")))
@@ -206,6 +207,9 @@ def synthesize_query(audio, task_id, byte_count, segment_sizes, received):
 
 
 def _prepare_query(audio, task_id, byte_count, segment_sizes, received, follow_on=False):
+    if follow_on:
+        log("local_follow_on_disabled", task_id=task_id)
+        return None
     start = {
         "task_id": task_id,
         "flow": task_id,
@@ -219,10 +223,6 @@ def _prepare_query(audio, task_id, byte_count, segment_sizes, received, follow_o
     query = strip_wake_word(text)
     if not query:
         log("local_wake_only", text=text, task_id=task_id)
-        _finish_output(task_id, 0, result="no speech")
-        return None
-    if follow_on and is_noise_transcript(query):
-        log("local_follow_on_noise", text=text, task_id=task_id)
         _finish_output(task_id, 0, result="no speech")
         return None
     result = _assistant("/answer", json.dumps({
@@ -270,6 +270,8 @@ class Stream:
         self.frame_offset = 0
         self.frame_count = 0
         self.service = None
+        self.wake_audio_seen = False
+        self.query_audio_seen = False
         self.heartbeat_task = None
         self.recognition_initialized = False
         self.endpoint_task = None
@@ -298,6 +300,12 @@ class Stream:
             for field, wire, value in fields:
                 if field == 1 and wire == 2:
                     self.service = value.decode("utf-8", errors="replace")[:80]
+                elif field in {62724734, 293101} and wire == 2:
+                    if any(f == 1 and w == 2 and audio for f, w, audio in _fields(value)):
+                        if field == 62724734:
+                            self.wake_audio_seen = True
+                        else:
+                            self.query_audio_seen = True
             if self.frame_count <= 3 or self.frame_count % 25 == 0:
                 log("s3_frame", flow=self.flow_id, frame=self.frame_count,
                     service=self.service, bytes=len(self.body),
@@ -352,6 +360,19 @@ class Server:
                             self._trailers(conn, writer, state.stream_id, 8, "request too large")
                             continue
                         frames = state.receive(event.data)
+                        # Complete a silenced voice turn as soon as its service
+                        # header arrives, even while the microphone upload is open.
+                        if state.service == "assistant" and CONTROL.silenced():
+                            if not state.task:
+                                state.task = asyncio.create_task(self.respond(conn, writer, state, window))
+                            continue
+                        # The hotword has its own audio extension and precedes
+                        # query audio on wake-word turns. Do not decide at the
+                        # initial service header: hotword frames can arrive later.
+                        if state.query_audio_seen and not state.wake_audio_seen:
+                            if not state.task:
+                                state.task = asyncio.create_task(self.respond(conn, writer, state, window))
+                            continue
                         if not state.endpoint_task and state.service == "assistant":
                             if any(field == 293101 for fields in frames for field, wire, value in fields):
                                 state.endpoint_task = asyncio.create_task(
@@ -468,7 +489,7 @@ class Server:
             await asyncio.sleep(SILENCE)
         except asyncio.CancelledError:
             return
-        if not state.done and not state.task and extract_flac_segments(bytes(state.body)):
+        if not state.done and not state.task and extract_query_audio(bytes(state.body)):
             state.task = asyncio.create_task(self.respond(conn, writer, state, window))
 
     async def quiet_close(self, conn, writer, state, window, reason):
@@ -500,6 +521,12 @@ class Server:
 
     async def _respond(self, conn, writer, state, window, no_speech):
         body = bytes(state.body)
+        if state.service in {None, "assistant"} and CONTROL.silenced():
+            await self.quiet_close(conn, writer, state, window, "assistant silenced")
+            return
+        if (state.service == "assistant" or state.query_audio_seen) and not state.wake_audio_seen:
+            await self.quiet_close(conn, writer, state, window, "follow-ups disabled")
+            return
         if no_speech:
             await self.quiet_close(conn, writer, state, window, "no speech")
             return

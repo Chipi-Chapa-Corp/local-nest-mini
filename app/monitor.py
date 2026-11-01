@@ -8,6 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from .control import CONTROL
+
 PAGE = (Path(__file__).with_name("monitor.html")).read_bytes()
 
 
@@ -47,6 +49,7 @@ def _recent_requests(log_path: Path, limit: int = 80, tail: int = 1024 * 1024) -
 
 class MonitorHandler(BaseHTTPRequestHandler):
     store = None
+    control = CONTROL
     test_pipeline = None
     max_body = 32 * 1024 * 1024
     log_path = Path("data/logs/proxy-events.jsonl")
@@ -67,6 +70,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/assistant":
+            self._json(200, {"silenced": self.control.silenced()})
+            return
         if path == "/":
             self._send(200, PAGE, "text/html; charset=utf-8")
             return
@@ -94,6 +100,23 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/assistant":
+            try:
+                length = int(self.headers.get("content-length", "0"))
+                if length < 0 or length > 1024:
+                    self._json(413, {"error": "Request too large"})
+                    self.close_connection = True
+                    return
+                data = json.loads(self.rfile.read(length))
+                if not isinstance(data, dict) or type(data.get("silenced")) is not bool:
+                    raise ValueError("silenced must be a boolean")
+                self.control.set_silenced(data["silenced"])
+                self._json(200, {"silenced": self.control.silenced()})
+            except (ValueError, UnicodeError) as exc:
+                self._json(400, {"error": str(exc)})
+            except OSError:
+                self._json(500, {"error": "Could not change assistant mode"})
+            return
         if path == "/api/tests" or path.startswith("/api/tests/"):
             try:
                 if self.test_pipeline is None:
@@ -138,10 +161,12 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
 
 def start_monitor(store, *, host: str, port: int, log_path: Path,
-                  test_pipeline=None, max_body=32 * 1024 * 1024) -> ThreadingHTTPServer:
+                  test_pipeline=None, max_body=32 * 1024 * 1024,
+                  control=CONTROL) -> ThreadingHTTPServer:
     handler = type("BoundMonitorHandler", (MonitorHandler,), {
         "store": store, "log_path": log_path,
         "test_pipeline": test_pipeline, "max_body": max_body,
+        "control": control,
     })
     server = ThreadingHTTPServer((host, port), handler)
     thread = threading.Thread(target=server.serve_forever, name="task-monitor", daemon=True)

@@ -11,6 +11,7 @@ import tempfile
 import time
 import traceback
 import uuid
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -18,7 +19,9 @@ from urllib.parse import parse_qs, urlparse
 from .monitor import start_monitor
 from .omnivoice_tts import MODEL as OMNIVOICE_MODEL_NAME
 from .player import PLAYER
-from .processor import respond
+from .processor import respond, streaming_enabled
+from .reply_stream import ReplyStreams
+from .omnivoice_stream import NativeStreamError, stream_lines
 from .tasks import TASKS, TaskCancelled
 from .test_pipeline import TestPipeline
 
@@ -262,7 +265,7 @@ def _synthesize_omnivoice_gpu(text, lang, output, task_id, free_mib):
                 vram_free_mib=round(free_mib))
 
 
-def _synthesize_omnivoice(text, lang, output, task_id):
+def _synthesize_omnivoice(text, lang, output, task_id, cpu_only_reason=None):
     if not _omnivoice_ready():
         raise RuntimeError("OmniVoice environment, model or voice reference missing; run host/setup-omnivoice.sh")
     text = _strip_sound_tags(text)
@@ -275,10 +278,10 @@ def _synthesize_omnivoice(text, lang, output, task_id):
     try:
         TASKS.check(task_id)
         # Probe VRAM after the lock, right before running: a game may have started meanwhile.
-        gpu_ready = _omnivoice_gpu_ready()
+        gpu_ready = not cpu_only_reason and _omnivoice_gpu_ready()
         free = _gpu_free_vram_mib() if gpu_ready else None
         if not gpu_ready:
-            cpu_reason = "GPU disabled or not set up"
+            cpu_reason = cpu_only_reason or "GPU disabled or not set up"
         elif free is None:
             cpu_reason = "no VRAM information"
         else:
@@ -320,7 +323,7 @@ def _synthesize_omnivoice(text, lang, output, task_id):
         OMNIVOICE_LOCK.release()
 
 
-def synthesize(text: str, lang: str = "en", task_id: str | None = None) -> Path:
+def synthesize(text: str, lang: str = "en", task_id: str | None = None, *, cpu_only_reason=None) -> Path:
     text = text.strip()
     if not text:
         raise ValueError("text must not be empty")
@@ -334,7 +337,10 @@ def synthesize(text: str, lang: str = "en", task_id: str | None = None) -> Path:
     output = TTS_DIR / f"reply-{uuid.uuid4().hex}.wav"
     if TTS_BACKEND != "omnivoice":
         raise RuntimeError(f"Unknown TTS_BACKEND: {TTS_BACKEND}")
-    _synthesize_omnivoice(text, lang, output, task_id)
+    if cpu_only_reason:
+        _synthesize_omnivoice(text, lang, output, task_id, cpu_only_reason)
+    else:
+        _synthesize_omnivoice(text, lang, output, task_id)
     output.chmod(0o644)
     return output
 
@@ -361,6 +367,67 @@ def transcode_ogg(source: Path, task_id: str | None = None) -> Path:
         raise RuntimeError(detail or "Opus conversion failed")
     output.chmod(0o644)
     return output
+
+
+@lru_cache(maxsize=4)
+def _native_line_streaming(binary):
+    try:
+        result = subprocess.run([str(binary), "--help"], capture_output=True, timeout=5)
+        return b"--stream-by-line" in result.stdout + result.stderr
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def synthesize_lines(next_line, lang, task_id):
+    """Native GPU line streaming; use existing per-line inference as fallback."""
+    from .omnivoice_tts import REFERENCE_TEXT
+    pending = []
+    cpu_reason = None
+    def speech_line(extra_stop=None):
+        while True:
+            line = next_line(extra_stop)
+            if line is None:
+                return None
+            text = _strip_sound_tags(line)
+            if text:
+                return text
+    while not OMNIVOICE_LOCK.acquire(timeout=.1):
+        TASKS.check(task_id)
+    try:
+        TASKS.check(task_id)
+        free = _gpu_free_vram_mib() if _omnivoice_gpu_ready() else None
+        if (free is not None and free > OMNIVOICE_GPU_MIN_FREE_MIB
+                and _native_line_streaming(str(OMNIVOICE_GPU_BIN))):
+            reference_rvq = OMNIVOICE_REFERENCE.with_suffix(".rvq")
+            reference = (["--ref-rvq", reference_rvq] if reference_rvq.is_file()
+                         else ["--ref-wav", OMNIVOICE_REFERENCE])
+            with tempfile.TemporaryDirectory(prefix="omnivoice-stream-") as temp:
+                ref_text = Path(temp) / "reference.txt"
+                ref_text.write_text(REFERENCE_TEXT)
+                command = [OMNIVOICE_GPU_BIN, "--device", OMNIVOICE_GPU_DEVICE,
+                           "--model", OMNIVOICE_GPU_MODEL, "--codec", OMNIVOICE_GPU_CODEC,
+                           "--lang", lang if lang != "auto" else "none", *reference,
+                           "--ref-text", ref_text, "--seed", "1234", "--steps", OMNIVOICE_GPU_STEPS,
+                           "--stream-by-line", "--format", "wav16", "-o", "-"]
+                TASKS.start(task_id, "tts", engine="OmniVoice GPU (native line stream)",
+                            vram_free_mib=round(free))
+                try:
+                    yield from stream_lines(command, speech_line, store=TASKS, task_id=task_id,
+                                            output_dir=TTS_DIR)
+                    return
+                except NativeStreamError as exc:
+                    pending = exc.pending
+                    cpu_reason = str(exc)
+    finally:
+        OMNIVOICE_LOCK.release()
+    while True:
+        line = pending.pop(0) if pending else speech_line()
+        if line is None:
+            return
+        TASKS.check(task_id)
+        text = _strip_sound_tags(line)
+        path = synthesize(text, lang, task_id, cpu_only_reason=cpu_reason)
+        yield line, path
 
 
 def _wants_play(data, query):
@@ -406,6 +473,10 @@ def _output(task_id, result, data, query):
     TASKS.finish(task_id, "output", **player)
 
 
+STREAMS = ReplyStreams(TASKS, respond=respond, synthesize=synthesize_lines,
+                       transcode=transcode_ogg, duration=_audio_duration, urls=tts_urls, player=PLAYER)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "local-nest-mini/1"
 
@@ -446,7 +517,8 @@ class Handler(BaseHTTPRequestHandler):
                 "tts_backend_supported": TTS_BACKEND == "omnivoice",
                 "russian_tts": _omnivoice_ready(),
                 "tts_dir": TTS_DIR.is_dir(),
-                "player": OUTPUT_MODE != "cast" or (not PLAYER_ENABLED) or PLAYER.available(),
+                "player": ((PLAYER_ENABLED and PLAYER.available()) if streaming_enabled() and OUTPUT_MODE == "native"
+                           else OUTPUT_MODE != "cast" or (not PLAYER_ENABLED) or PLAYER.available()),
                 "output_mode": OUTPUT_MODE,
                 "native_template": OUTPUT_MODE != "native" or NATIVE_TEMPLATE.is_file(),
             }
@@ -520,6 +592,9 @@ class Handler(BaseHTTPRequestHandler):
                 meta = dict(data)
                 meta.pop("task_id", None)
                 error = meta.pop("error", None)
+                if STREAMS.deliver(task_id, meta.get("bytes", 0), error):
+                    self._json(200, {"task_id": task_id, "streaming": True})
+                    return
                 if error:
                     TASKS.fail(task_id, "output", str(error), **meta)
                 else:
@@ -554,6 +629,10 @@ class Handler(BaseHTTPRequestHandler):
                 task_id = _ensure_task(task_id, source="http")
                 text = str(data.get("text", "")).strip()
                 lang = str(data.get("lang", "auto")).lower()
+                if OUTPUT_MODE == "native" and streaming_enabled():
+                    stage = "process"
+                    self._json(200, STREAMS.start(task_id, text, lang))
+                    return
                 stage = "process"
                 TASKS.start(task_id, stage, text=text, lang=lang)
                 reply = respond(text)
@@ -636,7 +715,7 @@ def main():
                                 log_path=LOG_PATH, test_pipeline=tests, max_body=MAX_BODY)
         print(f"monitor listening on {MONITOR_HOST}:{monitor.server_port}", flush=True)
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
-    if OUTPUT_MODE == "cast" and PLAYER_ENABLED and PLAYER.available():
+    if (OUTPUT_MODE == "cast" or streaming_enabled()) and PLAYER_ENABLED and PLAYER.available():
         threading.Thread(target=PLAYER.warm, name="cast-warm", daemon=True).start()
     print(f"processor listening on {LISTEN_HOST}:{LISTEN_PORT}", flush=True)
     server.serve_forever()

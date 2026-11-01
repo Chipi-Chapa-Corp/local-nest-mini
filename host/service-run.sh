@@ -130,7 +130,11 @@ cleanup() {
     wait "$proxy_pid" 2>/dev/null || true
   fi
 }
-trap cleanup EXIT INT TERM
+# A systemd stop/restart interrupts wait -n with 128 + signal. Exit
+# successfully for the supervisor's own stop signal; EXIT still cleans up.
+# Unexpected child failures below retain their original nonzero status.
+trap cleanup EXIT
+trap 'exit 0' INT TERM
 
 if [[ "$ASSISTANT_ENABLED" == 1 ]]; then
   .venv/bin/python -m app.server &

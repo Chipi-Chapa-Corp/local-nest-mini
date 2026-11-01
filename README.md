@@ -66,15 +66,78 @@ choose **Cast to Nest** or **Play** in the browser. Microphone recording require
 localhost or HTTPS; recordings stop automatically after 60 seconds.
 Each pipeline step shows its elapsed time, updating while it runs.
 
+The monitor's **Stop assistant** button keeps network interception running and
+immediately answers each new Nest voice request with an empty native reply,
+without STT, LLM generation or TTS. **Resume assistant** restores normal replies.
+This mode is shared by all monitor tabs and survives service restarts. It does
+not clear conversation history or affect browser test pipelines. **Pause updates**
+only pauses the monitor display.
+
+Follow-up turns without a fresh “Hey Google” are disabled. The local S3 endpoint
+returns the empty native reply as soon as query audio arrives without preceding
+hotword audio, while the upload is still open. Such turns skip speech detection,
+STT, LLM generation, TTS and Cast. Start each new request with “Hey Google”.
+
 The processor sends the transcript and Laylo's voice instructions to the configured
-API's `/chat/completions` endpoint, then passes the assistant's reply to local TTS
-and the selected playback transport. Each request is a fresh conversation. STT
+API, then passes the assistant's reply to local TTS
+and the selected playback transport. All Nest, HTTP and browser test requests
+share one conversation, retaining the latest 50 user/assistant messages (25 full
+exchanges). Older messages are dropped as new ones arrive; each API request
+includes at most 50 conversation messages plus the system instructions. Concurrent
+turns are processed in order. History lives in memory and resets on service
+restart. Failed requests and spoken error messages are not saved in history. STT
 and TTS remain local; transcripts go to your configured LLM provider. If generation
 fails, the reply becomes “Не получилось сгенерировать ответ. Диктую ошибку: …”
 with the error message, and continues through TTS and playback.
 
+`LLM_API=auto` (default) uses `/responses` on `api.openai.com` and
+`/chat/completions` on other hosts. Set `LLM_API=responses` or
+`LLM_API=chat_completions` to override this for another provider. OpenAI's
+`gpt-6.1-sol` rejects function tools with reasoning on Chat Completions, so it
+uses Responses. Responses requests set `store=false` and carry reasoning and
+tool output items through each tool round within the response. Final text and
+sentence streaming use the same history and playback paths with either API.
+
+Set `KEENABLE_API_KEY` in `.env` to enable Keenable `web_search` and
+`read_web_page`, matching the web tools in `context-tg`. The assistant can search
+for current facts and read relevant sources before giving a spoken answer.
+Each response has a hard limit of **five tool calls total**, including page
+reads, failed calls and calls in the same batch. Once exhausted, the model gets
+one final request with tool use disabled. The next user message starts a fresh
+allowance. Tool results are limited to 16 KB each and stay within the current
+response; the shared 50-message history retains user messages and final replies.
+
+Set `LLM_STREAMING=1` in `.env` to stream response text and start speech before
+the whole reply is generated. With `OUTPUT_MODE=native`, the model is instructed
+to put each sentence on its own line and end it with `.`, `!`, or `?`. Completed
+lines are synthesized as they arrive. On the GPU, the installed OmniVoice CLI's
+native `--stream-by-line -o -` mode keeps one model process for the response;
+each line becomes a separate WAV clip. The first clip completes when the next
+line's WAV header arrives, or at EOF for a one-line reply. If native line
+streaming is unavailable or fails, the remaining lines use the existing
+per-sentence inference path, with CPU fallback after a native GPU failure.
+Malformed lines fall back to splitting on sentence punctuation; a final line
+without a newline is flushed at the end of the text stream.
+
+The first sentence is returned through the normal Nest S3 response. Once its
+delivery is acknowledged, later sentences play through Cast in order. The
+handoff waits for the first clip's duration plus a short playback guard; this
+is an estimate, not a device playback-completion acknowledgement. Each Cast
+clip finishes before the next starts. Synthesis runs ahead with bounded queues.
+This requires `PLAYER_ENABLED=1` and the offline Cast receiver assets from
+`host/setup-cast.sh`. Interrupting the task stops queued playback, and a new
+streaming turn supersedes the previous turn's remaining speech. History saves
+the complete final response, and the five-tool budget still applies to the
+whole response. Browser Test pipelines keep their explicit playback controls.
+
+Research: the [chat streaming API](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)
+emits text deltas rather than sentence events. [OmniVoice's native CLI](https://github.com/ServeurpersoCom/omnivoice.cpp/blob/master/docs/ARCHITECTURE.md)
+supports incremental stdin and separate WAV headers per input line, which this
+path uses without replacing the pinned model or engine.
+
 LLM and local assistant HTTP requests allow five minutes (300 seconds) per
-request; `/answer` includes both LLM generation and TTS. Whisper inference also allows five minutes. OmniVoice retains its internal
+request; `/answer` includes LLM generation and TTS (up to the first audio clip
+in streaming mode). Whisper inference also allows five minutes. OmniVoice retains its internal
 ten-minute limit. S3 heartbeats continue during processing, but these timeouts
 do not override any deadline enforced by the Nest itself.
 

@@ -269,6 +269,7 @@ for line in sys.stdin:
             yield 'First.', path
             raise NativeStreamError('device lost', ['Second.'])
         with patch.object(server, 'TASKS', self.store), \
+             patch.object(server, 'TTS_BACKEND', 'omnivoice'), \
              patch.object(server, '_omnivoice_gpu_ready', return_value=True), \
              patch.object(server, '_gpu_free_vram_mib', return_value=3000), \
              patch.object(server, '_native_line_streaming', return_value=True), \

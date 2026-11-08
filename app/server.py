@@ -2,6 +2,7 @@
 """Small HTTP service for local transcription, LLM replies, and TTS."""
 
 import json
+import atexit
 import math
 import os
 import re
@@ -17,6 +18,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .monitor import start_monitor
+from .fast_tts import FastTTS, MODELS as FAST_TTS_MODELS
 from .omnivoice_tts import MODEL as OMNIVOICE_MODEL_NAME
 from .player import PLAYER
 from .processor import respond, streaming_enabled
@@ -32,7 +34,12 @@ TTS_DIR.mkdir(parents=True, exist_ok=True)
 STT_MODEL = Path(os.environ.get("STT_MODEL", "/app/models/stt/futo.bin"))
 WHISPER_BIN = Path(os.environ.get("WHISPER_BIN", "/usr/local/bin/whisper-cli"))
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-TTS_BACKEND = os.environ.get("TTS_BACKEND", "omnivoice").lower()
+TTS_BACKEND = os.environ.get("TTS_BACKEND", "silero_pocket").lower()
+FAST_TTS = FastTTS(
+    os.environ.get("FAST_TTS_PYTHON", str(PROJECT_DIR / "models/fast-tts-env/bin/python")),
+    os.environ.get("FAST_TTS_DIR", str(PROJECT_DIR / "models/fast-tts")),
+    threads=int(os.environ.get("FAST_TTS_THREADS", "2")))
+atexit.register(FAST_TTS.close)
 OMNIVOICE_PYTHON = Path(os.environ.get("OMNIVOICE_PYTHON", str(PROJECT_DIR / "models/omnivoice-env/bin/python")))
 OMNIVOICE_DIR = Path(os.environ.get("OMNIVOICE_DIR", str(PROJECT_DIR / "models/omnivoice")))
 OMNIVOICE_REFERENCE = Path(os.environ.get("OMNIVOICE_REFERENCE", str(PROJECT_DIR / "models/omnivoice-voices/laylo-en.wav")))
@@ -335,9 +342,19 @@ def synthesize(text: str, lang: str = "en", task_id: str | None = None, *, cpu_o
     if lang not in {"en", "ru"}:
         raise ValueError("lang must be en or ru")
     output = TTS_DIR / f"reply-{uuid.uuid4().hex}.wav"
-    if TTS_BACKEND != "omnivoice":
+    if TTS_BACKEND == "silero_pocket":
+        text = _strip_sound_tags(text)
+        if not text:
+            raise ValueError("text must contain speech, not only sound tags")
+        TASKS.check(task_id)
+        if task_id:
+            TASKS.start(task_id, "tts", engine=FAST_TTS_MODELS[lang])
+        report = FAST_TTS.synthesize(text, lang, output, check=lambda: TASKS.check(task_id))
+        if task_id:
+            TASKS.start(task_id, "tts", engine=report["engine"], metrics=report)
+    elif TTS_BACKEND != "omnivoice":
         raise RuntimeError(f"Unknown TTS_BACKEND: {TTS_BACKEND}")
-    if cpu_only_reason:
+    elif cpu_only_reason:
         _synthesize_omnivoice(text, lang, output, task_id, cpu_only_reason)
     else:
         _synthesize_omnivoice(text, lang, output, task_id)
@@ -379,7 +396,7 @@ def _native_line_streaming(binary):
 
 
 def synthesize_lines(next_line, lang, task_id):
-    """Native GPU line streaming; use existing per-line inference as fallback."""
+    """Synthesize each incoming sentence with resident models or the legacy GPU path."""
     from .omnivoice_tts import REFERENCE_TEXT
     pending = []
     cpu_reason = None
@@ -391,6 +408,11 @@ def synthesize_lines(next_line, lang, task_id):
             text = _strip_sound_tags(line)
             if text:
                 return text
+    if TTS_BACKEND == "silero_pocket":
+        while (text := speech_line()) is not None:
+            TASKS.check(task_id)
+            yield text, synthesize(text, lang, task_id)
+        return
     while not OMNIVOICE_LOCK.acquire(timeout=.1):
         TASKS.check(task_id)
     try:
@@ -507,15 +529,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
+            fast = TTS_BACKEND == "silero_pocket"
+            tts_ready = FAST_TTS.available() if fast else _omnivoice_ready()
             checks = {
                 "stt_model": STT_MODEL.is_file(),
                 "whisper": WHISPER_BIN.is_file(),
-                "tts": _omnivoice_ready(),
+                "tts": tts_ready,
                 "tts_backend": TTS_BACKEND,
                 # Informational (a string, so it never fails the check): CPU covers an absent GPU.
-                "tts_gpu": "ready" if _omnivoice_gpu_ready() else "unavailable",
-                "tts_backend_supported": TTS_BACKEND == "omnivoice",
-                "russian_tts": _omnivoice_ready(),
+                "tts_gpu": "not used" if fast else ("ready" if _omnivoice_gpu_ready() else "unavailable"),
+                "tts_backend_supported": TTS_BACKEND in {"silero_pocket", "omnivoice"},
+                "russian_tts": tts_ready,
                 "tts_dir": TTS_DIR.is_dir(),
                 "player": ((PLAYER_ENABLED and PLAYER.available()) if streaming_enabled() and OUTPUT_MODE == "native"
                            else OUTPUT_MODE != "cast" or (not PLAYER_ENABLED) or PLAYER.available()),
@@ -529,8 +553,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {
                 "stt": str(STT_MODEL),
                 "tts_backend": TTS_BACKEND,
-                "tts_en": OMNIVOICE_MODEL_NAME,
-                "tts_ru": OMNIVOICE_MODEL_NAME,
+                "tts_en": FAST_TTS_MODELS["en"] if TTS_BACKEND == "silero_pocket" else OMNIVOICE_MODEL_NAME,
+                "tts_ru": FAST_TTS_MODELS["ru"] if TTS_BACKEND == "silero_pocket" else OMNIVOICE_MODEL_NAME,
             })
             return
         if path == "/tasks":
@@ -708,6 +732,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    if TTS_BACKEND == "silero_pocket":
+        FAST_TTS.warm()
     if MONITOR_ENABLED:
         tests = TestPipeline(TASKS, transcribe=transcribe_audio, respond=respond,
                              synthesize=synthesize, urls=tts_urls, player=PLAYER, data_dir=DATA_DIR)

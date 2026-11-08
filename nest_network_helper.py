@@ -25,8 +25,10 @@ import subprocess
 import threading
 import time
 import urllib.request
-from http.client import HTTPException
 from pathlib import Path
+
+from app.nest_discovery import (Discovery, LEASE_SECONDS, VerifiedNest, monitor_nest,
+                                set_ipv4_address)
 
 STOP = threading.Event()
 # Errors from a raw socket whose interface went down, vanished, or is briefly
@@ -106,34 +108,6 @@ class RawLink:
             self.sock = None
 
 
-def monitor_nest(nest, expected_mac, connected, record, stop=STOP):
-    """Keep retrying an absent Nest; authorize redirection only for its MAC."""
-    previous = None
-    try:
-        while not stop.is_set():
-            try:
-                with urllib.request.urlopen(
-                        f'http://{nest}:8008/setup/eureka_info', timeout=3) as response:
-                    info = json.load(response)
-                actual_mac = info.get('mac_address', '') if isinstance(info, dict) else ''
-                state = ('connected' if isinstance(actual_mac, str) and
-                         actual_mac.lower() == expected_mac.lower() else 'identity_mismatch')
-            except (OSError, ValueError, HTTPException):
-                state = 'disconnected'
-            if stop.is_set():
-                break
-            if state == 'connected':
-                connected.set()
-            else:
-                connected.clear()
-            if state != previous:
-                record(kind=f'nest_{state}', nest=nest)
-                previous = state
-            stop.wait(5)
-    finally:
-        connected.clear()
-
-
 def checksum(data):
     if len(data) % 2:
         data += b'\0'
@@ -203,10 +177,24 @@ def link_local(mac):
     return str(ipaddress.IPv6Address(b'\xfe\x80' + bytes(6) + iid))
 
 
+def ipv4_routing_rules(interface, table, local_mac, nest_mac, pc):
+    """Rules match the owned MAC and an expiring set of verified IPv4 addresses."""
+    return f'''table ip {table} {{
+ set nest_ipv4 {{ type ipv4_addr; flags timeout; timeout {LEASE_SECONDS}s; }}
+ chain ingress_nat {{ type nat hook prerouting priority dstnat; policy accept;
+  iifname "{interface}" ether daddr {local_mac} ether saddr {nest_mac} ip saddr @nest_ipv4 tcp dport {{ 80, 443 }} dnat to {pc}
+ }}
+ chain gate {{ type filter hook prerouting priority -90; policy accept;
+  iifname "{interface}" ether daddr {local_mac} ether saddr {nest_mac} ip saddr @nest_ipv4 ip daddr != {pc} udp dport {{ 443, 18445 }} reject with icmp type port-unreachable
+  iifname "{interface}" ether daddr {local_mac} ether saddr {nest_mac} ip saddr @nest_ipv4 ip daddr != {pc} drop
+ }}
+}}\n'''
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--interface', required=True)
-    parser.add_argument('--nest', required=True)
+    parser.add_argument('--nest', default='', help='Optional initial IP hint; the MAC identifies the Nest')
     parser.add_argument('--nest-mac', required=True)
     parser.add_argument('--pc', required=True)
     parser.add_argument('--gateway', required=True)
@@ -215,7 +203,7 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('Run in the host terminal with sudo; raw Ethernet and temporary nft rules require root.')
-    for value in (args.nest, args.pc, args.gateway):
+    for value in (args.pc, args.gateway, *([args.nest] if args.nest else [])):
         ipaddress.IPv4Address(value)
     if args.duration != 0 and not 30 <= args.duration <= 3600:
         parser.error('Duration must be 0 or 30..3600 seconds')
@@ -240,6 +228,11 @@ def main():
     addresses = json.loads(subprocess.check_output([ipcmd, '-j', '-4', 'addr', 'show', 'dev', args.interface]))
     if not any(a['local'] == args.pc for item in addresses for a in item.get('addr_info', [])):
         parser.error('PC address/interface mismatch')
+    local = next(a for item in addresses for a in item.get('addr_info', []) if a['local'] == args.pc)
+    network = ipaddress.IPv4Network(f"{args.pc}/{local['prefixlen']}", strict=False)
+    discovery = Discovery(args.interface, args.pc, network, args.nest_mac, ipcmd=ipcmd, hint=args.nest)
+    target = VerifiedNest(args.nest_mac, folder / 'data/nest-address.json')
+    target.publish(None)
     # Warm up the gateway neighbor entry without any authentication attempt.
     try:
         urllib.request.urlopen(f'http://{args.gateway}/', timeout=3).close()
@@ -267,18 +260,32 @@ def main():
     except PermissionError:
         parser.error('Raw networking is denied even as root. This is commonly a rootless container; run the helper in the host OS terminal, outside the container. No ARP or nft changes have been made.')
     connected = threading.Event()
+    def publish(address):
+        try:
+            set_ipv4_address(nft, table, address)
+        except BaseException:
+            target.publish(None)
+            raise
+        target.publish(address)
+
+    def current_nest():
+        return target.current() if connected.is_set() else None
+
     monitor = threading.Thread(target=monitor_nest,
-                               args=(args.nest, args.nest_mac, connected, record), daemon=True)
+                               args=(args.nest, args.nest_mac, connected, record, STOP),
+                               kwargs={'discover': discovery.candidates, 'publish': publish,
+                                       'probe': discovery.probe}, daemon=True)
 
     class Bridge(socketserver.BaseRequestHandler):
         def handle(self):
-            if self.client_address[0] != args.nest or not connected.is_set():
+            address = current_nest()
+            if self.client_address[0] != address:
                 return
             destination = 18445 if self.server.server_address[1] == 443 else 18081
             try:
                 with socket.create_connection(('127.0.0.1', destination), timeout=5) as upstream:
                     self.request.settimeout(5)
-                    while not STOP.is_set() and connected.is_set():
+                    while not STOP.is_set() and current_nest() == address:
                         ready, _, _ = select.select([self.request, upstream], [], [], 0.5)
                         for current in ready:
                             data = current.recv(65536)
@@ -294,6 +301,7 @@ def main():
 
     servers = []
     applied = False
+    last_nest = None
     try:
         for port in ((443,) if args.shared_http else (443, 80)):
             server = Server((args.pc, port), Bridge)
@@ -302,15 +310,7 @@ def main():
         # Prevent the kernel forwarding/rejecting the gateway-addressed packets.
         # Raw DNS replies are generated below, before this hook. Local PC traffic
         # remains local. No global firewall chains are edited or flushed.
-        rule = f'''table ip {table} {{
- chain ingress_nat {{ type nat hook prerouting priority dstnat; policy accept;
-  iifname "{args.interface}" ether daddr {local_mac.hex(':')} ether saddr {args.nest_mac} ip saddr {args.nest} tcp dport {{ 80, 443 }} dnat to {args.pc}
- }}
- chain gate {{ type filter hook prerouting priority -90; policy accept;
-  iifname "{args.interface}" ether daddr {local_mac.hex(':')} ip saddr {args.nest} ip daddr != {args.pc} udp dport {{ 443, 18445 }} reject with icmp type port-unreachable
-  iifname "{args.interface}" ether daddr {local_mac.hex(':')} ip saddr {args.nest} ip daddr != {args.pc} drop
- }}
-}}\n'''
+        rule = ipv4_routing_rules(args.interface, table, local_mac.hex(':'), args.nest_mac, args.pc)
         if gateway6:
             rule += f'''table ip6 {table} {{
  chain gate {{ type filter hook prerouting priority -90; policy accept;
@@ -323,7 +323,7 @@ def main():
             signal.signal(sig, lambda *_: STOP.set())
         monitor.start()
         limit = 'until stopped' if args.duration == 0 else f'auto-stop after {args.duration}s'
-        print(f'READY: waiting for {args.nest} / {args.nest_mac}; {limit}. Ctrl-C restores networking.', flush=True)
+        print(f'READY: discovering {args.nest_mac} (IP hint {args.nest or "none"}); {limit}. Ctrl-C restores networking.', flush=True)
         if gateway6:
             print(f'IPv6 gateway {gateway6} is redirected for this Nest only; IPv6 WAN is rejected locally.', flush=True)
             record(kind='ipv6_redirect_active', nest=nest6, gateway=gateway6)
@@ -331,27 +331,26 @@ def main():
         deadline = None if args.duration == 0 else time.monotonic() + args.duration
         next_arp = 0
         last_ipv6_reject = 0
-        was_connected = False
         while not STOP.is_set() and (deadline is None or time.monotonic() < deadline):
             if stop_file.exists():
                 break
-            if not connected.is_set():
-                was_connected = False
-                STOP.wait(0.2)
-                continue
-            if not was_connected:
-                next_arp = 0  # Reapply the gateway announcement immediately on reconnect.
-                was_connected = True
+            nest = current_nest()
+            if nest and nest != last_nest:
+                next_arp = 0  # Reapply the gateway announcement immediately on a new lease.
+                last_nest = nest
             now = time.monotonic()
-            if now >= next_arp:
+            if nest and now >= next_arp:
                 # The first successful send after an outage reapplies the redirect.
-                if link.send(arp_reply(local_mac, args.gateway, nest_mac, args.nest)) and gateway6:
+                if link.send(arp_reply(local_mac, args.gateway, nest_mac, nest)) and gateway6:
                     link.send(neighbor_advertisement(local_mac, nest_mac, gateway6, nest6, local_mac))
                 next_arp = now + 1
             frame = link.recv()
             if frame is None:
                 if link.down:
                     STOP.wait(1)
+                continue
+            discovery.observe(frame)
+            if not nest:
                 continue
             if (len(frame) >= 54 and frame[:6] == local_mac and frame[6:12] == nest_mac
                     and frame[12:14] == b'\x86\xdd'):
@@ -369,7 +368,7 @@ def main():
             if len(frame) < 42 or frame[:6] != local_mac or frame[6:12] != nest_mac or frame[12:14] != b'\x08\x00':
                 continue
             ip = frame[14:]
-            if socket.inet_ntoa(ip[12:16]) != args.nest:
+            if socket.inet_ntoa(ip[12:16]) != nest:
                 continue
             ihl = (ip[0] & 15) * 4
             if len(ip) < ihl + 8:
@@ -393,26 +392,28 @@ def main():
             result = dns_answer(udp[8:size], args.pc)
             if result:
                 answer, name, qtype = result
-                link.send(udp_frame(local_mac, nest_mac, socket.inet_ntoa(ip[16:20]), args.nest, 53, src_port, answer))
+                link.send(udp_frame(local_mac, nest_mac, socket.inet_ntoa(ip[16:20]), nest, 53, src_port, answer))
                 record(kind='dns', name=name, type=qtype, answer=args.pc if qtype == 1 else 'empty')
     finally:
+        restore_nest = target.current() or last_nest
         STOP.set()
         if monitor.is_alive():
-            monitor.join(timeout=4)
+            monitor.join(timeout=8)
         if applied:
             subprocess.run([nft, 'delete', 'table', 'ip', table], check=False)
             if gateway6:
                 subprocess.run([nft, 'delete', 'table', 'ip6', table], check=False)
-            for _ in range(5):
+            for _ in range(5 if restore_nest else 0):
                 # Keep the Ethernet source as this PC to avoid teaching the LAN
                 # switch that the router's own MAC moved to this PC's port.
-                link.send(arp_reply(gateway_mac, args.gateway, nest_mac, args.nest, local_mac))
+                link.send(arp_reply(gateway_mac, args.gateway, nest_mac, restore_nest, local_mac))
                 if gateway6:
                     link.send(neighbor_advertisement(local_mac, nest_mac, gateway6, nest6, gateway6_mac))
                 time.sleep(0.1)
         for server in servers:
             server.shutdown()
             server.server_close()
+        discovery.close()
         link.close()
         print('Stopped; temporary nft table removed and Nest gateway ARP restored.', flush=True)
         record(kind='stopped', table=table)

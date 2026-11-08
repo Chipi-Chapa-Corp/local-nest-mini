@@ -12,7 +12,7 @@ fi
 set -a
 . "$PROJECT_DIR/config.env"
 set +a
-: "${NEST_IP:?missing NEST_IP}"
+: "${NEST_MAC:?missing NEST_MAC}"
 
 if ! systemctl cat local-infra-gateway.service >/dev/null 2>&1; then
   echo 'Install the shared gateway first: sudo bash ~/Projects/Misc/local-infra/scripts/install-gateway.sh' >&2
@@ -36,18 +36,18 @@ install -m 0644 "$rendered_unit" "$UNIT"
 if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
   changed=0
   for port in 80 443 8099; do
-    rule="rule family=ipv4 source address=$NEST_IP port port=$port protocol=tcp accept"
+    rule="rule family=ipv4 source mac=$NEST_MAC port port=$port protocol=tcp accept"
     if ! firewall-cmd --permanent --query-rich-rule="$rule" >/dev/null 2>&1; then
       firewall-cmd --permanent --add-rich-rule="$rule" >/dev/null
       changed=1
-      echo "added firewall rule for $NEST_IP tcp/$port"
+      echo "added firewall rule for $NEST_MAC tcp/$port"
     fi
   done
   if [[ "$changed" == 1 ]]; then
     firewall-cmd --reload >/dev/null
   fi
 else
-  echo "firewalld not active; ensure TCP 80/443/8099 from $NEST_IP is allowed" >&2
+  echo "firewalld not active; ensure TCP 80/443/8099 from $NEST_MAC is allowed" >&2
 fi
 
 systemctl daemon-reload

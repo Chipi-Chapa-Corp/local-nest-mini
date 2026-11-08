@@ -49,12 +49,14 @@ services:
       PLAYER_ENABLED: "1"
       CAST_NAME: Office speaker
       OMNIVOICE_PYTHON: /opt/omnivoice/bin/python
+      FAST_TTS_PYTHON: /opt/fast-tts/bin/python
     mem_limit: 8g
     memswap_limit: 8g
     volumes:
       - ./data:/data
       - ./models/omnivoice:/app/models/omnivoice:ro
       - ./models/omnivoice-voices:/app/models/omnivoice-voices:ro
+      - ./models/fast-tts:/app/models/fast-tts:ro
     restart: "no"
     depends_on:
       proxy:

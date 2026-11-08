@@ -15,7 +15,7 @@ if [[ -f .env ]]; then
   . ./.env
 fi
 set +a
-for var in NEST_IP NEST_MAC PC_IP GATEWAY INTERFACE; do
+for var in NEST_MAC PC_IP GATEWAY INTERFACE; do
   : "${!var:?missing $var in config.env}"
 done
 : "${SERVICE_DURATION:=0}"
@@ -32,7 +32,7 @@ export TTS_DIR="$PROJECT_DIR/data/tts"
 export PROXY_CONFIG="$PROJECT_DIR/proxy-config"
 export STT_MODEL="$PROJECT_DIR/models/stt/futo.bin"
 export WHISPER_BIN="$PROJECT_DIR/bin/whisper-cli"
-export TTS_BACKEND="${TTS_BACKEND:-omnivoice}"
+export TTS_BACKEND="${TTS_BACKEND:-silero_pocket}"
 export LISTEN_HOST=0.0.0.0
 export LISTEN_PORT=8099
 export ASSISTANT_URL="${ASSISTANT_URL:-http://127.0.0.1:8099}"
@@ -49,7 +49,17 @@ export MONITOR_PORT="${MONITOR_PORT:-53412}"
 
 if [[ "$ASSISTANT_ENABLED" == 1 ]]; then
   [[ -x "$WHISPER_BIN" ]] || { echo "missing Whisper binary" >&2; exit 1; }
-  [[ "$TTS_BACKEND" == omnivoice ]] || { echo "unsupported TTS_BACKEND: $TTS_BACKEND (use omnivoice)" >&2; exit 1; }
+  [[ "$TTS_BACKEND" == omnivoice || "$TTS_BACKEND" == silero_pocket ]] || {
+    echo "unsupported TTS_BACKEND: $TTS_BACKEND (use silero_pocket or omnivoice)" >&2; exit 1;
+  }
+  if [[ "$TTS_BACKEND" == silero_pocket ]]; then
+    fast_tts_python="${FAST_TTS_PYTHON:-$PROJECT_DIR/models/fast-tts-env/bin/python}"
+    [[ -x "$fast_tts_python" ]] || { echo 'run bash host/setup-fast-tts.sh'; exit 1; }
+    "$fast_tts_python" -I "$PROJECT_DIR/app/fast_tts_worker.py" \
+      --assets "${FAST_TTS_DIR:-$PROJECT_DIR/models/fast-tts}" --threads "${FAST_TTS_THREADS:-2}" --check || {
+      echo 'Speech models unavailable; run bash host/setup-fast-tts.sh'; exit 1;
+    }
+  fi
   if [[ "$TTS_BACKEND" == omnivoice ]]; then
     omnivoice_python="${OMNIVOICE_PYTHON:-$PROJECT_DIR/models/omnivoice-env/bin/python}"
     [[ -x "$omnivoice_python" ]] || {
@@ -167,15 +177,17 @@ if [[ "$ASSISTANT_ENABLED" == 1 && "$OUTPUT_MODE" == native ]]; then
     .venv/bin/python -m app.s3_server &
   fi
   s3_pid=$!
+  s3_ready=0
   for _ in $(seq 1 80); do
-    if timeout 1 bash -c '</dev/tcp/127.0.0.1/18444' 2>/dev/null; then
+    if timeout 2 .venv/bin/python -m app.s3_health 2>/dev/null; then
+      s3_ready=1
       break
     fi
     kill -0 "$s3_pid" 2>/dev/null || { echo "local S3 server exited during startup" >&2; exit 1; }
     sleep 0.25
   done
-  timeout 1 bash -c '</dev/tcp/127.0.0.1/18444' 2>/dev/null || {
-    echo "local S3 server did not open 18444" >&2; exit 1;
+  [[ "$s3_ready" == 1 ]] || {
+    echo "local S3 server did not become ready on 18444" >&2; exit 1;
   }
 fi
 
@@ -199,10 +211,10 @@ if ! timeout 1 bash -c '</dev/tcp/127.0.0.1/18445' 2>/dev/null; then
 fi
 
 echo "proxy pid $proxy_pid; data in $PROJECT_DIR/data"
-echo "starting helper for $NEST_IP ($NEST_MAC); service duration ${SERVICE_DURATION}s (0 means until stopped)"
+echo "starting helper for $NEST_MAC (IP hint ${NEST_IP:-none}); service duration ${SERVICE_DURATION}s (0 means until stopped)"
 python3 "$PROJECT_DIR/nest_network_helper.py" \
   --interface "$INTERFACE" \
-  --nest "$NEST_IP" \
+  --nest "${NEST_IP:-}" \
   --nest-mac "$NEST_MAC" \
   --pc "$PC_IP" \
   --gateway "$GATEWAY" \

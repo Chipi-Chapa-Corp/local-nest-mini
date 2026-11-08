@@ -56,6 +56,33 @@ class TTSTests(unittest.TestCase):
                     self.assertEqual(detail["engine"], "OmniVoice CPU")
                     self.assertEqual(detail["metrics"]["peak_rss_mib"], 2300)
 
+    def test_resident_models_route_languages_and_report_the_actual_engine(self):
+        def generate(text, lang, output, **kwargs):
+            kwargs["check"]()
+            output.write_bytes(b"RIFF")
+            return {"engine": server.FAST_TTS_MODELS[lang], "generation_seconds": .1}
+        with patch.object(server, "TTS_BACKEND", "silero_pocket"), \
+             patch.object(server.FAST_TTS, "synthesize", side_effect=generate) as synthesize:
+            for text, lang in (("Hello.", "en"), ("Это хоуминг.", "auto")):
+                task = self.store.create()
+                output = server.synthesize(text, lang, task["id"])
+                actual_lang = "ru" if lang == "auto" else "en"
+                self.assertEqual(synthesize.call_args.args[1], actual_lang)
+                self.assertEqual(output.stat().st_mode & 0o777, 0o644)
+                detail = self.store.get(task["id"])["stages"][0]["detail"]
+                self.assertEqual(detail["engine"], server.FAST_TTS_MODELS[actual_lang])
+
+    def test_resident_sentence_stream_uses_each_incoming_sentence_without_gpu(self):
+        lines = iter(["Hello.", "Привет.", None])
+        with patch.object(server, "TTS_BACKEND", "silero_pocket"), \
+             patch.object(server, "synthesize", return_value=self.root / "speech.wav") as synthesize, \
+             patch.object(server, "_omnivoice_gpu_ready") as gpu:
+            result = list(server.synthesize_lines(lambda stop=None: next(lines), "auto", None))
+        self.assertEqual([line for line, path in result], ["Hello.", "Привет."])
+        self.assertEqual([c.args[:2] for c in synthesize.call_args_list],
+                         [("Hello.", "auto"), ("Привет.", "auto")])
+        gpu.assert_not_called()
+
     def test_omnivoice_failure_cleans_up_and_releases_lock(self):
         def fail(command, **kwargs):
             command = list(map(str, command))

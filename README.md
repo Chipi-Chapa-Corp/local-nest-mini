@@ -27,8 +27,8 @@ app/server.py               Whisper STT → app/processor.py → TTS
 
 1. Put the files that are not in git in place:
    - `bin/whisper-cli` (static whisper.cpp) and `models/stt/futo.bin`
-   - OmniVoice CPU environment, pinned model and voice reference: run `bash host/setup-omnivoice.sh`
-   - optional OmniVoice GPU (Vulkan) build: run `bash host/setup-omnivoice-vulkan.sh` in the build toolbox
+   - Silero v5.6 and Pocket TTS 2M environment, models and voices: run `bash host/setup-fast-tts.sh`
+   - optional legacy OmniVoice backend: `bash host/setup-omnivoice.sh`, then optionally `bash host/setup-omnivoice-vulkan.sh`
    - captures from your own Nest: `data/native-template.bin`, `data/native-nospeech.bin`, `data/offline-account-ids.json`
 2. `cp config.env.example config.env`, then set the Nest and network values.
    Copy `.env.example` to `.env` and set `LLM_BASE_URL` (including `/v1` when
@@ -53,10 +53,16 @@ is a template; install it through `run.sh`. A different machine or Python versio
 may require recreating the ignored Python environments and rerunning setup.
 `bash host/service-run.sh --check` checks prerequisites without starting services.
 
-The Nest can be offline when the service starts. The helper checks its configured
-IP and MAC every five seconds, waits through disconnects, and reapplies network
-redirection when it reconnects. The assistant and proxy stay running. A different
-device at that IP is not redirected; update `NEST_IP` if the Nest's address changes.
+The Nest can be offline when the service starts. The helper discovers its address
+by `NEST_MAC` using the interface's neighbor cache and observed ARP/IPv4 traffic,
+and sends Cast mDNS discovery queries while it is missing. It verifies the MAC
+reported by the device every five seconds before enabling redirection. `NEST_IP`
+is an optional initial hint and can be empty. Address changes update a temporary
+nft set and `data/nest-address.json`; the shared gateway reads that verified lease
+for each connection. Both expire after twenty seconds without refresh. Firewall
+permissions match the Nest's MAC rather than its changing IP. Reconnects and DHCP
+changes need no configuration edits or service restarts; the assistant and proxy
+stay running. A different device claiming an old IP fails identity verification.
 
 `./run.sh restart|stop|logs|uninstall` · tasks: http://127.0.0.1:53412 · tests: `.venv/bin/python -m unittest discover -s tests`
 
@@ -110,12 +116,10 @@ response; the shared 50-message history retains user messages and final replies.
 Set `LLM_STREAMING=1` in `.env` to stream response text and start speech before
 the whole reply is generated. With `OUTPUT_MODE=native`, the model is instructed
 to put each sentence on its own line and end it with `.`, `!`, or `?`. Completed
-lines are synthesized as they arrive. On the GPU, the installed OmniVoice CLI's
-native `--stream-by-line -o -` mode keeps one model process for the response;
-each line becomes a separate WAV clip. The first clip completes when the next
-line's WAV header arrives, or at EOF for a one-line reply. If native line
-streaming is unavailable or fails, the remaining lines use the existing
-per-sentence inference path, with CPU fallback after a native GPU failure.
+lines are synthesized as they arrive. Silero and Pocket stay loaded in a shared
+CPU worker across sentences and requests; each sentence becomes a WAV clip.
+The optional OmniVoice GPU backend uses its native `--stream-by-line -o -`
+mode, with per-sentence CPU inference as fallback after a native GPU failure.
 Malformed lines fall back to splitting on sentence punctuation; a final line
 without a newline is flushed at the end of the text stream.
 
@@ -133,7 +137,7 @@ whole response. Browser Test pipelines keep their explicit playback controls.
 Research: the [chat streaming API](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)
 emits text deltas rather than sentence events. [OmniVoice's native CLI](https://github.com/ServeurpersoCom/omnivoice.cpp/blob/master/docs/ARCHITECTURE.md)
 supports incremental stdin and separate WAV headers per input line, which this
-path uses without replacing the pinned model or engine.
+optional OmniVoice path uses.
 
 LLM and local assistant HTTP requests allow five minutes (300 seconds) per
 request; `/answer` includes LLM generation and TTS (up to the first audio clip
@@ -146,7 +150,22 @@ receiver SDK, then restart. The proxy serves a local WAV receiver at the Nest's
 default receiver URL; other Google requests stay blocked. No receiver assets
 are downloaded at runtime.
 
-**OmniVoice** is the default for English and Russian, with 24 refinement steps.
+**Silero v5.6 / Xenia** for Russian and **Pocket TTS 2M / Alba** for English are
+the default (`TTS_BACKEND=silero_pocket`). Run `bash host/setup-fast-tts.sh` to
+prepare the separate CPU environment and local assets, then restart the service.
+Both models warm up at startup and remain resident across requests, using two
+CPU threads by default. `FAST_TTS_THREADS`, `FAST_TTS_PYTHON`, and `FAST_TTS_DIR`
+override the thread count, interpreter, and asset directory. Requests are
+serialized; cancellation stops the active worker and the next request starts
+a fresh one. Sentence streaming uses the same resident worker. Runtime inference
+is offline and uses no GPU. Each TTS task reports the selected engine and timing.
+
+These models do not reliably handle mixed-language text. The LLM is instructed
+to use only the request's language and script, translating or transliterating
+foreign terms, names, abbreviations and letters (for example, `Хоуминг` in a
+Russian reply). This is a generation instruction, not a hard output filter.
+
+**OmniVoice** remains an optional backend for English and Russian, with 24 refinement steps.
 Each reply first checks free VRAM on the discrete GPU (two amdgpu sysfs reads).
 With more than 1.7 GiB free it runs
 [omnivoice.cpp](https://github.com/ServeurpersoCom/omnivoice.cpp) on Vulkan with a
@@ -161,7 +180,7 @@ before synthesis. Each TTS task reports the engine, timing, and VRAM or RAM; a C
 run also records why the GPU was skipped. Requests are serialized. Runtime
 inference is offline.
 
-Setup: `bash host/setup-omnivoice.sh` (CPU path, required), then optionally
+Legacy setup: `bash host/setup-omnivoice.sh` (CPU path), then optionally
 `bash host/setup-omnivoice-vulkan.sh` inside the build toolbox (GPU path). Select
 `TTS_BACKEND=omnivoice` in `config.env` and run **`./run.sh install`**; the unit
 has `MemoryHigh=6G` and `MemoryMax=8G` for the CPU path's ~5.2 GiB peak. Settings:
@@ -171,13 +190,11 @@ has `MemoryHigh=6G` and `MemoryMax=8G` for the CPU path's ~5.2 GiB peak. Setting
 `OMNIVOICE_PYTHON`, `OMNIVOICE_DIR`, `OMNIVOICE_REFERENCE`, `OMNIVOICE_GPU_BIN`,
 `OMNIVOICE_GPU_MODEL`, and `OMNIVOICE_GPU_CODEC`.
 
-Compose builds the separate CPU inference environment and mounts local model/voice
-assets read-only, with an 8 GiB assistant limit. Run the setup script before
-building/starting Compose. The host service uses its existing model environment.
+Compose builds the inference environments and mounts local model/voice assets
+read-only, with an 8 GiB assistant limit. Run the selected backend's setup script
+before building/starting Compose.
 
-Only the configured OmniVoice backend and Whisper STT assets are retained.
-Old speech experiments, benchmark media, duplicate F32 GGUF weights and build
-intermediates have been removed. The CPU weights and environment remain because
+The optional OmniVoice CPU weights and environment remain because
 they provide the fallback when the GPU is busy.
 
 License: GPL-3.0, see `LICENSE`.

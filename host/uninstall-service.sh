@@ -19,11 +19,14 @@ if [[ -f "$PROJECT_DIR/config.env" ]]; then
   if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
     changed=0
     for port in 80 443 8099; do
-      rule="rule family=ipv4 source address=$NEST_IP port port=$port protocol=tcp accept"
-      if firewall-cmd --permanent --query-rich-rule="$rule" >/dev/null 2>&1; then
-        firewall-cmd --permanent --remove-rich-rule="$rule" >/dev/null
-        changed=1
-      fi
+      for source in "mac=${NEST_MAC:-}" "address=${NEST_IP:-}"; do
+        [[ -n "${source#*=}" ]] || continue
+        rule="rule family=ipv4 source $source port port=$port protocol=tcp accept"
+        if firewall-cmd --permanent --query-rich-rule="$rule" >/dev/null 2>&1; then
+          firewall-cmd --permanent --remove-rich-rule="$rule" >/dev/null
+          changed=1
+        fi
+      done
     done
     [[ "$changed" == 1 ]] && firewall-cmd --reload >/dev/null
   fi

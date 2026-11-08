@@ -41,6 +41,9 @@ WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY requirements-fast-tts.txt /app/requirements-fast-tts.txt
+RUN python -m venv /opt/fast-tts \
+ && /opt/fast-tts/bin/pip install --no-cache-dir -r /app/requirements-fast-tts.txt
 
 COPY --from=whisper-build /src/build/bin/whisper-cli /usr/local/bin/whisper-cli
 

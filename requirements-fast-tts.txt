@@ -1,0 +1,6 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.11.0+cpu
+pocket-tts==4.0.1
+numpy==2.5.4
+soundfile==0.14.0
+PyYAML==6.0.3

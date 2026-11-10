@@ -1,69 +1,81 @@
-services:
-  proxy:
-    image: local-nest-mini:latest
-    build:
-      context: .
-      dockerfile: Containerfile
-    network_mode: host
-    init: true
-    security_opt:
-      - label=disable
-    env_file:
-      - config.env
-    environment:
-      DATA_DIR: /data
-      PROXY_CONFIG: /app/proxy-config
-    volumes:
-      - ./data:/data
-      - ./proxy-config:/app/proxy-config:ro
-    command: ["/app/start-proxy.sh"]
-    restart: "no"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 18445), 2); s.close()"]
-      interval: 10s
-      timeout: 3s
-      retries: 12
-      start_period: 5s
+# Service templates extended by ../../compose.yml. Run the stack from local-infra.
+x-runtime: &runtime
+  image: localhost/local-nest-mini:1
+  build:
+    context: .
+    dockerfile: Containerfile
+    target: runtime
+  network_mode: host
+  init: true
+  security_opt:
+    - label=disable
+  restart: unless-stopped
+  pids_limit: 256
 
-  assistant:
-    image: local-nest-mini:latest
-    build:
-      context: .
-      dockerfile: Containerfile
-    network_mode: host
-    init: true
-    security_opt:
-      - label=disable
-    env_file:
-      - config.env
-      - path: .env
-        required: false
+services:
+  nest-assistant:
+    <<: *runtime
+    command: ["python", "-m", "app.server"]
     environment:
       DATA_DIR: /data
       TTS_DIR: /data/tts
       STT_MODEL: /app/models/stt/futo.bin
       WHISPER_BIN: /usr/local/bin/whisper-cli
+      FAST_TTS_PYTHON: /opt/fast-tts/bin/python
+      FAST_TTS_DIR: /app/models/fast-tts
       LISTEN_HOST: 0.0.0.0
       LISTEN_PORT: "8099"
-      STT_THREADS: "6"
-      PLAYER_ENABLED: "1"
-      CAST_NAME: Office speaker
-      OMNIVOICE_PYTHON: /opt/omnivoice/bin/python
-      FAST_TTS_PYTHON: /opt/fast-tts/bin/python
+      MONITOR_ENABLED: "1"
+      MONITOR_HOST: 127.0.0.1
+      MONITOR_PORT: "53412"
+      NATIVE_TEMPLATE: /data/native-template.bin
+      NATIVE_NOSPEECH_TEMPLATE: /data/native-nospeech.bin
+      HF_HUB_OFFLINE: "1"
     mem_limit: 8g
     memswap_limit: 8g
-    volumes:
-      - ./data:/data
-      - ./models/omnivoice:/app/models/omnivoice:ro
-      - ./models/omnivoice-voices:/app/models/omnivoice-voices:ro
-      - ./models/fast-tts:/app/models/fast-tts:ro
-    restart: "no"
-    depends_on:
-      proxy:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8099/health"]
       interval: 10s
-      timeout: 3s
+      timeout: 5s
       retries: 12
-      start_period: 5s
+      start_period: 90s
+
+  nest-s3:
+    <<: *runtime
+    command: ["python", "-m", "app.s3_server"]
+    environment:
+      DATA_DIR: /data
+      PROXY_CONFIG: /app/proxy-config
+      ASSISTANT_URL: http://127.0.0.1:8099
+      NATIVE_TEMPLATE: /data/native-template.bin
+      NATIVE_NOSPEECH_TEMPLATE: /data/native-nospeech.bin
+    mem_limit: 512m
+    depends_on:
+      nest-assistant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.s3_health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  nest-proxy:
+    <<: *runtime
+    command: ["/app/start-proxy.sh"]
+    environment:
+      DATA_DIR: /data
+      PROXY_CONFIG: /app/proxy-config
+      ASSISTANT_URL: http://127.0.0.1:8099
+      ASSISTANT_ENABLED: "1"
+      OUTPUT_MODE: native
+      ALLOW_GOOGLE_UPSTREAM: "0"
+      NATIVE_TEMPLATE: /data/native-template.bin
+    mem_limit: 512m
+    depends_on:
+      nest-s3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; [socket.create_connection(('127.0.0.1', p), 2).close() for p in (18081, 18445)]"]
+      interval: 10s
+      timeout: 5s
+      retries: 6

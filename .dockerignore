@@ -1,6 +1,12 @@
 .git
 .gitignore
 .venv
+.env
+models
+tests
+host
+docs
+bin
 __pycache__
 *.pyc
 data

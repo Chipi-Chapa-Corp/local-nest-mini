@@ -23,35 +23,48 @@ app/s3_server.py            mic audio in, end of speech detected, native reply o
 app/server.py               Whisper STT → app/processor.py → TTS
 ```
 
-## Setup
+## Setup (local-infra / Podman)
 
-1. Put the files that are not in git in place:
-   - `bin/whisper-cli` (static whisper.cpp) and `models/stt/futo.bin`
-   - Silero v5.6 and Pocket TTS 2M environment, models and voices: run `bash host/setup-fast-tts.sh`
-   - optional legacy OmniVoice backend: `bash host/setup-omnivoice.sh`, then optionally `bash host/setup-omnivoice-vulkan.sh`
-   - captures from your own Nest: `data/native-template.bin`, `data/native-nospeech.bin`, `data/offline-account-ids.json`
-2. `cp config.env.example config.env`, then set the Nest and network values.
-   Copy `.env.example` to `.env` and set `LLM_BASE_URL` (including `/v1` when
-   required by your provider) and `LLM_MODEL`. `LLM_API_KEY` and
-   `LLM_REASONING_EFFORT` are optional. These variables can also live in
-   `config.env`; `.env` takes precedence in the host service and Compose.
-3. `./run.sh` installs and starts the systemd service (needs sudo).
-4. Replug the Nest.
+The application runs as three rootless Podman containers in local-infra's
+**top-level `compose.yml`**: `nest-assistant` (including the monitor), `nest-s3`
+(native TLS/HTTP2 voice endpoint), and `nest-proxy`. Each uses host networking
+so Cast multicast, LAN audio downloads, the host gateway and loopback connections
+keep their existing addresses. The image owns Python and speech dependencies;
+models, device captures and configuration are mounted from this checkout.
+The small root `local-nest-network.service` runs only the standard-library
+DNS/ARP/NDP/firewall helper on the host. It has no dependency on `.venv` or Torch.
 
-The host needs Bash, Python 3 with `venv`/pip, ffmpeg, and systemd. Install
-dependencies and generate the proxy CA with `bash host/setup-host.sh` (also run
-automatically by `./run.sh install`). Models, binaries, credentials, certificates,
-and owned-device captures are private local assets and are ignored by git;
-they are not shipped with this repository. Complete steps 1–2 on a new checkout.
-Installation checks the runtime prerequisites before replacing the service unit.
+1. Retain `config.env`, `.env`, `proxy-config/`, `data/native-template.bin`,
+   `data/native-nospeech.bin`, `data/offline-account-ids.json`, `models/stt/futo.bin`
+   and the five speech assets in `models/fast-tts/`. These private local assets
+   are not included in Git or the image build context. Keep `PC_IP` and
+   `PUBLIC_BASE_URL` reachable from the Nest (currently port 8099 on the PC's LAN IP).
+2. From local-infra run `bash scripts/install-nest.sh`. It builds the runtime
+   image, starts the top-level Compose project and enables the user unit
+   `local-infra-compose.service`. The Compose provider uses a managed Python;
+   on a different machine set `COMPOSE_PYTHON` to a stable Python 3.12+ interpreter
+   before running `bash scripts/setup-compose.sh`.
+3. Once the containers are healthy, run `sudo bash scripts/install-nest-network.sh`
+   from local-infra. This verifies the endpoints, disables the old
+   `local-nest-mini.service`, and enables the host-only network helper.
+   If the old service is still running, stop it before step 2 to release its ports.
+4. Open **http://kitkat-pc/nest/**. The Nest should reconnect automatically;
+   replug it if it retains a failed connection from the migration.
 
-After moving the folder on the same host, run `./run.sh install` from its new
-location. Installation renders the systemd paths from that checkout and repairs
-the OmniVoice source link. Python tools run through their interpreter so moved
-virtual environments do not rely on old console-script paths. The tracked unit
-is a template; install it through `run.sh`. A different machine or Python version
-may require recreating the ignored Python environments and rerunning setup.
-`bash host/service-run.sh --check` checks prerequisites without starting services.
+From local-infra: `podman compose ps`, `podman compose logs -f`, or
+`./scripts/compose.sh up -d --build`. `make start|stop|restart|status` includes
+the Compose user unit; `make nest-logs` follows the Nest containers. Building
+`nest-assistant` also builds the shared image for the proxy and S3 services.
+A healthy S3 dependency is checked with TLS and HTTP/2 before the proxy starts.
+The existing gateway continues to own port 80 and forward `/nest/` to 53412.
+
+The `runtime` image target uses Silero/Pocket CPU speech. The `omnivoice` target
+retains the optional legacy backend; it is not built or selected by this stack.
+Legacy host setup scripts and `run.sh` remain for standalone installs; do not
+start that full host supervisor alongside the Compose stack.
+
+Tests: `.venv/bin/python -m unittest discover -s tests`. The host `.venv` is
+optional for development and is no longer used by the running assistant.
 
 The Nest can be offline when the service starts. The helper discovers its address
 by `NEST_MAC` using the interface's neighbor cache and observed ARP/IPv4 traffic,
@@ -64,7 +77,7 @@ permissions match the Nest's MAC rather than its changing IP. Reconnects and DHC
 changes need no configuration edits or service restarts; the assistant and proxy
 stay running. A different device claiming an old IP fails identity verification.
 
-`./run.sh restart|stop|logs|uninstall` · tasks: http://127.0.0.1:53412 · tests: `.venv/bin/python -m unittest discover -s tests`
+Tasks: http://127.0.0.1:53412 (also available through the shared `/nest/` gateway).
 
 The monitor’s **Test** button creates a browser test pipeline. Click the microphone
 to record, then stop to transcribe and generate a reply. At the final step,
@@ -190,9 +203,9 @@ has `MemoryHigh=6G` and `MemoryMax=8G` for the CPU path's ~5.2 GiB peak. Setting
 `OMNIVOICE_PYTHON`, `OMNIVOICE_DIR`, `OMNIVOICE_REFERENCE`, `OMNIVOICE_GPU_BIN`,
 `OMNIVOICE_GPU_MODEL`, and `OMNIVOICE_GPU_CODEC`.
 
-Compose builds the inference environments and mounts local model/voice assets
-read-only, with an 8 GiB assistant limit. Run the selected backend's setup script
-before building/starting Compose.
+Local-infra Compose builds the Silero/Pocket inference environment and mounts local
+model assets read-only, with an 8 GiB assistant limit. The optional `omnivoice`
+image target is separate from the default runtime.
 
 The optional OmniVoice CPU weights and environment remain because
 they provide the fallback when the GPU is busy.

@@ -24,7 +24,9 @@ class InstallTests(unittest.TestCase):
         self.repo.mkdir()
         for name in ("run.sh", "start-proxy.sh", "config.env.example", "requirements.txt",
                      "host/setup-host.sh", "host/service-run.sh", "host/render-service.py",
-                     "host/link-omnivoice.py", "host/local-nest-mini.service"):
+                     "host/link-omnivoice.py", "host/local-nest-mini.service",
+                     "host/helper-run.sh", "host/local-nest-network.service",
+                     "host/render-network-service.py"):
             target = self.repo / name
             target.parent.mkdir(exist_ok=True)
             # No executable bits: entrypoints invoked with bash must still work.
@@ -77,6 +79,44 @@ class InstallTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("copy config.env.example", result.stderr)
         self.assertNotIn("sudo", result.stderr)
+
+    def test_network_unit_uses_moved_checkout_and_only_host_helper(self):
+        self.move()
+        result = self.run_command(sys.executable, str(self.repo / "host/render-network-service.py"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('host/helper-run.sh', result.stdout)
+        self.assertNotIn('host/service-run.sh', result.stdout)
+        self.assertNotIn('.venv', result.stdout)
+        self.assertIn('Requires=local-infra-gateway.service', result.stdout)
+        self.assertNotIn('@HELPER_RUN@', result.stdout)
+        if shutil.which("systemd-analyze"):
+            unit = self.base / 'local-nest-network.service'
+            unit.write_text(result.stdout)
+            (self.base / 'local-infra-gateway.service').write_text(
+                '[Service]\nType=oneshot\nExecStart=/usr/bin/true\n')
+            verified = self.run_command('systemd-analyze', 'verify', str(unit))
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_container_helper_uses_stdlib_runtime_and_shared_gateway(self):
+        self.move()
+        (self.repo / 'config.env').write_text(
+            'NEST_MAC=aa:bb:cc:dd:ee:ff\nPC_IP=192.0.2.2\n'
+            'GATEWAY=192.0.2.1\nINTERFACE=test0\n')
+        commands = self.base / 'commands'
+        commands.mkdir()
+        python = commands / 'python3'
+        # Never execute real network redirection. Record the exec contract.
+        python.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CALLS"\n')
+        python.chmod(0o755)
+        calls = self.base / 'calls'
+        result = self.run_command('bash', str(self.repo / 'host/helper-run.sh'),
+            env=dict(os.environ, PATH=f'{commands}:{os.defpath}', CALLS=str(calls)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        invocations = calls.read_text().splitlines()
+        self.assertEqual(invocations[0], '-')  # stdlib readiness check first
+        self.assertIn('nest_network_helper.py', invocations[1])
+        self.assertIn('--duration 0 --shared-http', invocations[1])
+        self.assertIn('--nest-mac aa:bb:cc:dd:ee:ff', invocations[1])
 
     def test_stop_does_not_need_local_configuration(self):
         commands = self.base / "commands"

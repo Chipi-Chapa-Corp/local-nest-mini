@@ -23,10 +23,8 @@ RUN cmake -S /src -B /src/build -G "Unix Makefiles" \
  && cmake --build /src/build --target whisper-cli -j "$(nproc)"
 
 
-FROM docker.io/library/python:3.12-slim-bookworm
+FROM docker.io/library/python:3.12-slim-bookworm AS runtime
 
-ARG FUTO_STT_URL=https://keyboard.futo.org/voice-input-multilingual-244.bin
-ARG FUTO_STT_SHA256=15ef255465a6dc582ecf1ec651a4618c7ee2c18c05570bbe46493d248d465ac4
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HOME=/app \
@@ -49,19 +47,9 @@ COPY --from=whisper-build /src/build/bin/whisper-cli /usr/local/bin/whisper-cli
 
 RUN mkdir -p /app/models/stt /app/.cache
 
-RUN curl -fsSL "$FUTO_STT_URL" -o /app/models/stt/futo.bin \
- && echo "${FUTO_STT_SHA256}  /app/models/stt/futo.bin" | sha256sum -c -
+# Models and owned-device captures are mounted by local-infra Compose.
 
 COPY app /app/app
-RUN python -m venv /opt/omnivoice \
- && /opt/omnivoice/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
-      'torch==2.11.0+cpu' 'torchaudio==2.11.0+cpu' \
- && /opt/omnivoice/bin/pip install --no-cache-dir 'transformers==5.20.2' accelerate numpy soundfile librosa pydub \
- && git init /opt/omnivoice-src \
- && git -C /opt/omnivoice-src remote add origin https://github.com/k2-fsa/OmniVoice.git \
- && git -C /opt/omnivoice-src fetch --depth 1 origin 08be0b4ccbac3e13e374e86fbfead4b4cac343e2 \
- && git -C /opt/omnivoice-src checkout --detach FETCH_HEAD \
- && /opt/omnivoice/bin/python -c 'import site; from pathlib import Path; (Path(site.getsitepackages()[0]) / "omnivoice-source.pth").write_text("/opt/omnivoice-src\n")'
 COPY nest_relay.py /app/nest_relay.py
 COPY start-proxy.sh /app/start-proxy.sh
 RUN chmod 0755 /app/start-proxy.sh \
@@ -71,3 +59,15 @@ RUN mkdir -p /data/streams /data/tts /data/logs
 
 EXPOSE 8099
 CMD ["python", "-m", "app.server"]
+
+# Optional legacy backend. The normal build stops at the runtime target.
+FROM runtime AS omnivoice
+RUN python -m venv /opt/omnivoice \
+ && /opt/omnivoice/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+      'torch==2.11.0+cpu' 'torchaudio==2.11.0+cpu' \
+ && /opt/omnivoice/bin/pip install --no-cache-dir 'transformers==5.20.2' accelerate numpy soundfile librosa pydub \
+ && git init /opt/omnivoice-src \
+ && git -C /opt/omnivoice-src remote add origin https://github.com/k2-fsa/OmniVoice.git \
+ && git -C /opt/omnivoice-src fetch --depth 1 origin 08be0b4ccbac3e13e374e86fbfead4b4cac343e2 \
+ && git -C /opt/omnivoice-src checkout --detach FETCH_HEAD \
+ && /opt/omnivoice/bin/python -c 'import site; from pathlib import Path; (Path(site.getsitepackages()[0]) / "omnivoice-source.pth").write_text("/opt/omnivoice-src\n")'

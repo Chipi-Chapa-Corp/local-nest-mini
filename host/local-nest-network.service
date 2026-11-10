@@ -1,0 +1,25 @@
+[Unit]
+Description=Nest network redirection for local-infra Podman containers
+Requires=local-infra-gateway.service
+After=network-online.target local-infra-gateway.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/bash @HELPER_RUN@
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=150
+TimeoutStopSec=30
+UMask=0077
+TasksMax=32
+MemoryMax=128M
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=local-nest-network
+
+[Install]
+WantedBy=multi-user.target

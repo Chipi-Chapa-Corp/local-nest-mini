@@ -140,6 +140,9 @@ function steps(task){
     else label=cls==="skipped"?`${esc(idle)} · skipped`:esc(idle);
     if(test&&name==="output"&&cls==="waiting")label="Ready to play";
     let controls="";
+    if(!test&&name==="output"&&Number.isFinite(out.speech_to_native_ms)){
+      controls=`<div class="hint">First audio sent about ${secs(0,out.speech_to_native_ms/1000)} after speech ended</div>`;
+    }
     if(name==="tts"&&tts.metrics){
       const m=tts.metrics;
       const memory=m.vram_free_mib!=null?`${esc(m.vram_free_mib)} MiB VRAM free`:`${esc(m.peak_rss_mib)} MiB peak RAM`;

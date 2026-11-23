@@ -96,6 +96,46 @@ class S3TransportTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body, b"")
         self.assertEqual(trailers[b"grpc-status"], b"0")
 
+    async def test_live_cast_uploads_before_quiet_native_close(self):
+        quiet = _frame(_field(1, b"quiet"))
+        template = Path(self.temp.name) / "quiet.bin"
+        template.write_bytes(quiet)
+        first_chunk, committed = asyncio.Event(), asyncio.Event()
+
+        async def capture(reader, writer):
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                size = int(await reader.readline(), 16)
+                self.assertEqual(await reader.readexactly(size + 2), b"\x01\x00" * 32 + b"\r\n")
+                first_chunk.set()
+                self.assertEqual(await reader.readexactly(5), b"0\r\n\r\n")
+                committed.set()
+            finally:
+                writer.close()
+
+        async with await asyncio.start_server(capture, "127.0.0.1", 0) as upstream:
+            port = upstream.sockets[0].getsockname()[1]
+            with patch.object(s3_server, "voice_live_enabled", return_value=True), \
+                 patch.object(s3_server, "SILENCE", 5), \
+                 patch.object(s3_server, "ENDPOINT_INTERVAL", .01), \
+                 patch.object(s3_server, "ASSISTANT_URL", f"http://127.0.0.1:{port}"), \
+                 patch.object(s3_server, "NO_SPEECH_TEMPLATE", template), \
+                 patch.object(s3_server.endpoint, "decode_pcm", return_value=b"\x01\x00" * 32), \
+                 patch.object(s3_server, "_run_query") as native:
+                request = (_frame(_field(1, b"assistant")) + self.wake +
+                           _frame(_field(293101, _field(1, b"fLaC" + bytes(16)))))
+                self.client.send_data(1, request)
+                self.writer.write(self.client.data_to_send())
+                await asyncio.wait_for(first_chunk.wait(), 2)
+                self.assertFalse(committed.is_set())
+                self.client.send_data(1, _frame(_field(3, 1)))
+                self.writer.write(self.client.data_to_send())
+                body, trailers = await self.read_response()
+                await asyncio.wait_for(committed.wait(), 2)
+                self.assertTrue(body.endswith(quiet))
+                self.assertEqual(trailers[b"grpc-status"], b"0")
+                native.assert_not_called()
+
     async def test_settings_reply_is_served_from_local_capture(self):
         request = _frame(_field(1, b"assistant-settings")) + _frame(_field(3, 1))
         reply = _frame(_field(119658398, _field(2, b""))) + _frame(_field(1, 1))
@@ -225,22 +265,29 @@ class S3TransportTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_endpoint_stops_recording_and_replies_while_upload_is_open(self):
         audio = _frame(_field(293101, _field(1, b"fLaC" + bytes(16))))
+        finished = threading.Event()
         # The no-new-data fallback must not be what ends this turn.
         with patch.object(s3_server, "SILENCE", 30), \
              patch.object(s3_server.endpoint, "decode_pcm", return_value=b""), \
+             patch.object(s3_server.endpoint, "frame_levels", return_value=[-40.0] * 33), \
              patch.object(s3_server.endpoint, "decide",
                           return_value=(s3_server.endpoint.SPEECH_END, 1.5)), \
-             patch.object(s3_server, "_run_query", return_value=("test", b"native-reply", {})) as query:
+             patch.object(s3_server, "_run_query", return_value=("test", b"native-reply", {})) as query, \
+             patch.object(s3_server, "_finish_output", side_effect=lambda *args, **kwargs: finished.set()) as finish:
             # The device keeps its upload open, as the live Nest does.
             self.client.send_data(1, _frame(_field(1, b"assistant")) + self.wake + audio)
             self.writer.write(self.client.data_to_send())
             body, trailers = await self.read_response()
+            self.assertTrue(await asyncio.to_thread(finished.wait, 1))
         self.assertEqual(self.stop_events(body)[-1], 3)
         self.assertTrue(body.endswith(b"native-reply"))
         self.assertLess(body.rindex(_field(1, 3)), body.rindex(b"native-reply"))
         self.assertEqual(trailers[b"grpc-status"], b"0")
         query.assert_called_once()
         self.assertFalse(query.call_args.args[-1], "a fresh hotword turn is processed normally")
+        finish.assert_called_once()
+        timing = finish.call_args.kwargs
+        self.assertEqual(timing["speech_to_native_ms"] - timing["endpoint_to_native_ms"], 1800)
 
     async def test_follow_on_closes_before_upload_end_without_any_inference(self):
         template = Path(self.temp.name) / "nospeech.bin"

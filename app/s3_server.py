@@ -33,6 +33,7 @@ from app import endpoint
 from app.control import CONTROL
 from app.s3_audio import (extract_flac_segments, extract_query_audio, has_wake_audio,
                           strip_wake_word)
+from app.voice_live import enabled as voice_live_enabled
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 TEMPLATE = Path(os.environ.get("NATIVE_TEMPLATE", str(DATA_DIR / "native-template.bin")))
@@ -229,6 +230,7 @@ def _prepare_query(audio, task_id, byte_count, segment_sizes, received, follow_o
         "text": query,
         "lang": _reply_lang(query),
         "play": False,
+        "native_ack": True,
         "task_id": task_id,
     }).encode(), "application/json", task_id)
     ogg = Path(result["audio_ogg_path"]).read_bytes()
@@ -253,6 +255,54 @@ def _cancel_query(task_id):
         log("task_cancel_error", task_id=task_id, error=f"{type(exc).__name__}: {exc}")
 
 
+class VoiceUpload:
+    def __init__(self, task_id):
+        self.task_id = task_id
+        self.writer = None
+        self.audio = b""
+        self.sent = 0
+        self.failed = False
+        self.lock = asyncio.Lock()
+
+    async def feed(self, audio, pcm=None):
+        async with self.lock:
+            if self.failed or audio == self.audio:
+                return
+            try:
+                if pcm is None:
+                    pcm = await asyncio.to_thread(endpoint.decode_pcm, audio)
+                if len(pcm) <= self.sent:
+                    return
+                if self.writer is None:
+                    url = urllib.parse.urlsplit(ASSISTANT_URL)
+                    if url.scheme != "http" or url.hostname != "127.0.0.1":
+                        raise ValueError("Voice Live capture needs a loopback assistant URL")
+                    _, self.writer = await asyncio.wait_for(
+                        asyncio.open_connection(url.hostname, url.port or 80), 2)
+                    query = urllib.parse.urlencode({"task_id": self.task_id, "lang": ASSISTANT_LANG})
+                    self.writer.write(
+                        f"POST /voice/live?{query} HTTP/1.1\r\nHost: {url.netloc}\r\n"
+                        "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n".encode("ascii"))
+                chunk = pcm[self.sent:]
+                self.writer.write(f"{len(chunk):x}\r\n".encode("ascii") + chunk + b"\r\n")
+                await asyncio.wait_for(self.writer.drain(), 2)
+                self.sent = len(pcm)
+                self.audio = audio
+            except (OSError, ValueError, TimeoutError) as exc:
+                self.failed = True
+                self.close()
+                log("voice_upload_error", task_id=self.task_id, error=type(exc).__name__)
+
+    async def commit(self):
+        self.writer.write(b"0\r\n\r\n")
+        await asyncio.wait_for(self.writer.drain(), 2)
+
+    def close(self):
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+
+
 class Stream:
     def __init__(self, stream_id, headers, started):
         self.stream_id = stream_id
@@ -267,6 +317,7 @@ class Stream:
         self.response_sent = False
         self.debounce_task = None
         self.flow_id = uuid.uuid4().hex
+        self.voice = None
         self.frame_offset = 0
         self.frame_count = 0
         self.service = None
@@ -275,6 +326,8 @@ class Stream:
         self.heartbeat_task = None
         self.recognition_initialized = False
         self.endpoint_task = None
+        self.speech_end_detected_at = None
+        self.trailing_audio_ms = None
         self.capture = DATA_DIR / "streams" / f"{self.flow_id}-req.bin"
 
     def receive(self, data):
@@ -373,6 +426,8 @@ class Server:
                             if not state.task:
                                 state.task = asyncio.create_task(self.respond(conn, writer, state, window))
                             continue
+                        if state.voice is None and state.query_audio_seen and voice_live_enabled():
+                            state.voice = VoiceUpload(state.flow_id)
                         if not state.endpoint_task and state.service == "assistant":
                             if any(field == 293101 for fields in frames for field, wire, value in fields):
                                 state.endpoint_task = asyncio.create_task(
@@ -415,6 +470,8 @@ class Server:
                     elif isinstance(event, StreamReset):
                         state = streams.pop(event.stream_id, None)
                         if state:
+                            if state.voice:
+                                state.voice.close()
                             for task in (state.task, state.debounce_task, state.heartbeat_task, state.endpoint_task):
                                 if task:
                                     task.cancel()
@@ -430,6 +487,8 @@ class Server:
             log("s3_connection_error", error=f"{type(exc).__name__}: {exc}")
         finally:
             for state in streams.values():
+                if state.voice:
+                    state.voice.close()
                 for task in (state.task, state.debounce_task, state.heartbeat_task, state.endpoint_task):
                     if task:
                         task.cancel()
@@ -449,10 +508,16 @@ class Server:
             while not state.done:
                 await asyncio.sleep(ENDPOINT_INTERVAL)
                 audio = extract_query_audio(bytes(state.body))
-                levels = endpoint.frame_levels(await asyncio.to_thread(endpoint.decode_pcm, audio))
+                pcm = await asyncio.to_thread(endpoint.decode_pcm, audio)
+                if state.voice and not state.done and state.wake_audio_seen:
+                    await state.voice.feed(audio, pcm)
+                levels = endpoint.frame_levels(pcm)
                 decision, at = endpoint.decide(levels)
                 if not decision or state.done:
                     continue
+                if decision == endpoint.SPEECH_END:
+                    state.speech_end_detected_at = time.monotonic()
+                    state.trailing_audio_ms = round((len(levels) * endpoint.FRAME / endpoint.RATE - at) * 1000)
                 await self._send_data(conn, writer, state.stream_id,
                                       recording_stop(int(at * 1_000_000)), window)
                 log("s3_endpoint", flow=state.flow_id, decision=decision,
@@ -516,6 +581,8 @@ class Server:
             raise
         finally:
             state.closed = True
+            if state.voice:
+                state.voice.close()
             if state.heartbeat_task:
                 state.heartbeat_task.cancel()
 
@@ -549,6 +616,16 @@ class Server:
         capture = DATA_DIR / "streams" / f"{state.flow_id}-req.bin"
         capture.parent.mkdir(parents=True, exist_ok=True)
         capture.write_bytes(body)
+        if state.voice:
+            await state.voice.feed(audio)
+            if state.voice.writer is not None:
+                state.query_started = True
+                await self.quiet_close(conn, writer, state, window, "reply via live Cast")
+                try:
+                    await state.voice.commit()
+                except (OSError, TimeoutError) as exc:
+                    log("voice_upload_error", task_id=state.flow_id, error=type(exc).__name__)
+                return
         try:
             async with self.model_lock:
                 state.query_started = True
@@ -572,9 +649,14 @@ class Server:
             writer.write(conn.data_to_send())
             await writer.drain()
             state.delivered = True
+            timing = {}
+            if state.speech_end_detected_at is not None:
+                endpoint_ms = round((time.monotonic() - state.speech_end_detected_at) * 1000)
+                timing["endpoint_to_native_ms"] = endpoint_ms
+                timing["speech_to_native_ms"] = state.trailing_audio_ms + endpoint_ms
             log("s3_response", flow=task_id, bytes=len(native),
-                text=answer.get("response", ""), audio_url=answer.get("audio_url", ""))
-            await asyncio.to_thread(_finish_output, task_id, len(native))
+                text=answer.get("response", ""), audio_url=answer.get("audio_url", ""), **timing)
+            await asyncio.to_thread(_finish_output, task_id, len(native), **timing)
         except Exception as exc:
             log("s3_send_error", flow=state.flow_id, error=f"{type(exc).__name__}: {exc}")
             await asyncio.to_thread(_finish_output, state.flow_id, 0, f"{type(exc).__name__}: {exc}")

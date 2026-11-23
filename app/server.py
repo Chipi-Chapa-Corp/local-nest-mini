@@ -12,6 +12,7 @@ import tempfile
 import time
 import traceback
 import uuid
+import wave
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .monitor import start_monitor
 from .fast_tts import FastTTS, MODELS as FAST_TTS_MODELS
+from .live_turn import LiveTurns
 from .omnivoice_tts import MODEL as OMNIVOICE_MODEL_NAME
 from .player import PLAYER
 from .processor import respond, streaming_enabled
@@ -26,6 +28,7 @@ from .reply_stream import ReplyStreams
 from .omnivoice_stream import NativeStreamError, stream_lines
 from .tasks import TASKS, TaskCancelled
 from .test_pipeline import TestPipeline
+from .voice_live import enabled as voice_live_enabled
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 TTS_DIR = Path(os.environ.get("TTS_DIR", str(DATA_DIR / "tts")))
@@ -33,6 +36,7 @@ TTS_DIR.mkdir(parents=True, exist_ok=True)
 
 STT_MODEL = Path(os.environ.get("STT_MODEL", "/app/models/stt/futo.bin"))
 WHISPER_BIN = Path(os.environ.get("WHISPER_BIN", "/usr/local/bin/whisper-cli"))
+WHISPER_GPU_BIN = os.environ.get("WHISPER_GPU_BIN", "")
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 TTS_BACKEND = os.environ.get("TTS_BACKEND", "silero_pocket").lower()
 FAST_TTS = FastTTS(
@@ -78,6 +82,7 @@ MONITOR_HOST = os.environ.get("MONITOR_HOST", "127.0.0.1")
 MONITOR_PORT = int(os.environ.get("MONITOR_PORT", "53412"))
 MONITOR_ENABLED = os.environ.get("MONITOR_ENABLED", "1").lower() in {"1", "true", "yes"}
 LOG_PATH = DATA_DIR / "logs" / "proxy-events.jsonl"
+CAST_SDK_FILES = ("cast_receiver_framework.js", "castlite_js_lib.js", "sizzle.js")
 
 
 def _stop_process(proc) -> None:
@@ -141,6 +146,12 @@ def _run(cmd, *, timeout, stdin=None, task_id=None):
 
 
 def _audio_duration(path: Path, task_id: str | None = None) -> float:
+    TASKS.check(task_id)
+    try:
+        with wave.open(str(path), "rb") as audio:
+            return audio.getnframes() / audio.getframerate()
+    except (OSError, EOFError, wave.Error):
+        pass
     result = _run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", path],
@@ -176,12 +187,16 @@ def transcribe_audio(source: Path, lang: str = "auto", task_id: str | None = Non
         lang = (lang or "auto").lower()
         if lang not in {"auto", "en", "ru"}:
             raise ValueError("lang must be auto, en, or ru")
-        result = _run(
-            [WHISPER_BIN, "-m", STT_MODEL, "-l", lang, "-t", STT_THREADS,
-             "-nt", "-np", "--audio-ctx", str(audio_ctx), "-f", wav],
-            timeout=300,
-            task_id=task_id,
-        )
+        args = ["-m", STT_MODEL, "-l", lang, "-t", STT_THREADS, "-nt", "-np",
+                "--audio-ctx", str(audio_ctx), "-f", wav]
+        result = None
+        if WHISPER_GPU_BIN:
+            try:
+                result = _run([WHISPER_GPU_BIN, *args], timeout=10, task_id=task_id)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if result is None or result.returncode:
+            result = _run([WHISPER_BIN, *args], timeout=300, task_id=task_id)
         if result.returncode:
             raise RuntimeError(result.stderr.decode(errors="replace").strip() or "whisper failed")
         lines = []
@@ -457,6 +472,14 @@ def _wants_play(data, query):
     return str(value).lower() in {"1", "true", "yes"}
 
 
+def _streams_native_reply(*, acknowledged=False):
+    if OUTPUT_MODE != "native":
+        return False
+    cast_ready = (acknowledged and PLAYER_ENABLED and PLAYER.available()
+                  and all((DATA_DIR / "cast" / name).is_file() for name in CAST_SDK_FILES))
+    return streaming_enabled(default=cast_ready)
+
+
 def _task_id(query, data=None):
     raw = (data or {}).get("task_id") or query.get("task_id", [""])[0]
     raw = str(raw or "").strip()
@@ -499,6 +522,22 @@ STREAMS = ReplyStreams(TASKS, respond=respond, synthesize=synthesize_lines,
                        transcode=transcode_ogg, duration=_audio_duration, urls=tts_urls, player=PLAYER)
 
 
+def _speak_pcm(text, lang, task_id):
+    path = synthesize(text, lang, task_id)
+    try:
+        output = _run(["ffmpeg", "-v", "error", *FFMPEG_THREADS, "-i", path,
+                       "-ac", "1", "-ar", "24000", "-f", "s16le", "pipe:1"],
+                      timeout=15, task_id=task_id)
+        if output.returncode:
+            raise RuntimeError("Could not convert speech to PCM")
+        return output.stdout
+    finally:
+        path.unlink(missing_ok=True)
+
+
+LIVE_TURNS = LiveTurns(TASKS, PLAYER, PUBLIC_BASE_URL, transcribe_audio, _speak_pcm)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "local-nest-mini/1"
 
@@ -526,6 +565,25 @@ class Handler(BaseHTTPRequestHandler):
     def _query(self):
         return parse_qs(urlparse(self.path).query)
 
+    def _voice_chunks(self):
+        remaining = MAX_BODY
+        while True:
+            header = self.rfile.readline(32)
+            if not header:
+                raise EOFError("Voice capture disconnected")
+            if not re.fullmatch(rb"[0-9a-fA-F]+\r\n", header):
+                raise ValueError("Invalid voice chunk header")
+            size = int(header, 16)
+            if size > remaining or size % 2:
+                raise ValueError("Invalid voice chunk size")
+            chunk = self.rfile.read(size)
+            if len(chunk) != size or self.rfile.read(2) != b"\r\n":
+                raise EOFError("Voice capture ended inside a chunk")
+            if not size:
+                return
+            remaining -= size
+            yield chunk
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/health":
@@ -544,6 +602,7 @@ class Handler(BaseHTTPRequestHandler):
                 "player": ((PLAYER_ENABLED and PLAYER.available()) if streaming_enabled() and OUTPUT_MODE == "native"
                            else OUTPUT_MODE != "cast" or (not PLAYER_ENABLED) or PLAYER.available()),
                 "output_mode": OUTPUT_MODE,
+                "voice_live": "configured" if voice_live_enabled() else "disabled",
                 "native_template": OUTPUT_MODE != "native" or NATIVE_TEMPLATE.is_file(),
             }
             self._json(200 if all(checks.values()) else 503,
@@ -559,6 +618,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/tasks":
             self._json(200, {"tasks": TASKS.snapshot()})
+            return
+        if match := re.fullmatch(r"/tts/live/([0-9a-f]{32})\.mp3", path):
+            stream = LIVE_TURNS.get(match[1])
+            if stream is None:
+                self._json(404, {"error": "Voice stream unavailable"})
+                return
+            self.send_response(200)
+            self.send_header("content-type", "audio/mpeg")
+            self.send_header("access-control-allow-origin", "*")
+            self.send_header("cache-control", "no-store")
+            self.send_header("connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            self.connection.settimeout(10)
+            try:
+                for audio in stream.read():
+                    self.wfile.write(audio)
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                pass
             return
         if path.startswith("/tts/"):
             name = Path(path[5:]).name
@@ -589,6 +667,19 @@ class Handler(BaseHTTPRequestHandler):
         try:
             query = self._query()
             path = urlparse(self.path).path
+            if path == "/voice/live":
+                task_id = _task_id(query)
+                lang = query.get("lang", ["auto"])[0]
+                if (not voice_live_enabled() or self.client_address[0] != "127.0.0.1"
+                        or not re.fullmatch(r"[0-9a-f]{32}", task_id or "")
+                        or lang not in {"auto", "en", "ru"}
+                        or self.headers.get("transfer-encoding") != "chunked"):
+                    self._json(400, {"error": "Invalid local voice capture"})
+                    return
+                self.connection.settimeout(15)
+                LIVE_TURNS.run(task_id, self._voice_chunks(), lang,
+                               lambda: self._json(202, {"task_id": task_id}))
+                return
             raw = self._body()
             data = json.loads(raw or b"{}") if path not in {"/transcribe", "/turn"} else {}
             task_id = _task_id(query, data)
@@ -600,6 +691,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not TASKS.exists(task_id):
                     TASKS.create(task_id, source="nest")
                 TASKS.cancel(task_id)
+                if stream := LIVE_TURNS.get(task_id):
+                    threading.Thread(target=PLAYER.stop, args=(stream.url,), daemon=True).start()
                 self._json(200, {"task_id": task_id, "interrupted": True})
                 return
             if path == "/task/start":
@@ -616,7 +709,9 @@ class Handler(BaseHTTPRequestHandler):
                 meta = dict(data)
                 meta.pop("task_id", None)
                 error = meta.pop("error", None)
-                if STREAMS.deliver(task_id, meta.get("bytes", 0), error):
+                timing = {key: meta[key] for key in ("endpoint_to_native_ms", "speech_to_native_ms")
+                          if key in meta}
+                if STREAMS.deliver(task_id, meta.get("bytes", 0), error, **timing):
                     self._json(200, {"task_id": task_id, "streaming": True})
                     return
                 if error:
@@ -653,7 +748,7 @@ class Handler(BaseHTTPRequestHandler):
                 task_id = _ensure_task(task_id, source="http")
                 text = str(data.get("text", "")).strip()
                 lang = str(data.get("lang", "auto")).lower()
-                if OUTPUT_MODE == "native" and streaming_enabled():
+                if _streams_native_reply(acknowledged=data.get("native_ack") is True):
                     stage = "process"
                     self._json(200, STREAMS.start(task_id, text, lang))
                     return
@@ -734,6 +829,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if TTS_BACKEND == "silero_pocket":
         FAST_TTS.warm()
+    if voice_live_enabled():
+        LIVE_TURNS.warm()
     if MONITOR_ENABLED:
         tests = TestPipeline(TASKS, transcribe=transcribe_audio, respond=respond,
                              synthesize=synthesize, urls=tts_urls, player=PLAYER, data_dir=DATA_DIR)
@@ -741,7 +838,8 @@ def main():
                                 log_path=LOG_PATH, test_pipeline=tests, max_body=MAX_BODY)
         print(f"monitor listening on {MONITOR_HOST}:{monitor.server_port}", flush=True)
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
-    if (OUTPUT_MODE == "cast" or streaming_enabled()) and PLAYER_ENABLED and PLAYER.available():
+    warm_cast = voice_live_enabled() or OUTPUT_MODE == "cast" or _streams_native_reply(acknowledged=True)
+    if warm_cast and PLAYER_ENABLED and PLAYER.available():
         threading.Thread(target=PLAYER.warm, name="cast-warm", daemon=True).start()
     print(f"processor listening on {LISTEN_HOST}:{LISTEN_PORT}", flush=True)
     server.serve_forever()

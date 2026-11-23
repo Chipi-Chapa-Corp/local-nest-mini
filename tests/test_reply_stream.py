@@ -25,7 +25,7 @@ class LineTests(unittest.TestCase):
         buffer = LineBuffer(lines.append)
         for text in ("Hello.", "\n\nТемпература три", " градуса!\r", "\n", "Value 3.", "14 is fine. Why?!", " Last part"):
             buffer.feed(text)
-        self.assertEqual(lines, ["Hello.", "Температура три градуса!"])
+        self.assertEqual(lines, ["Hello.", "Температура три градуса!", "Value 3.14 is fine.", "Why?!"])
         buffer.finish()
         self.assertEqual(lines, ["Hello.", "Температура три градуса!", "Value 3.14 is fine.", "Why?!", "Last part"])
 
@@ -56,7 +56,7 @@ class ReplyStreamTests(unittest.TestCase):
             time.sleep(.01)
         self.fail("Streaming worker did not finish")
 
-    def manager(self, respond, synthesize=None):
+    def manager(self, respond, synthesize=None, guard=.01):
         def clips(next_line, lang, task_id):
             while True:
                 line = next_line()
@@ -69,7 +69,7 @@ class ReplyStreamTests(unittest.TestCase):
                                transcode=lambda path, task_id: path.with_suffix('.ogg'),
                                duration=lambda path, task_id: .05,
                                urls=lambda path: {"audio_url": str(path), "audio_path": str(path)},
-                               player=self.player, guard=.01)
+                               player=self.player, guard=guard)
         self.jobs.append(manager)
         return manager
 
@@ -138,6 +138,21 @@ class ReplyStreamTests(unittest.TestCase):
         self.assertEqual(self.player.play.call_count, 1)
         self.assertEqual(self.store.get(task['id'])['status'], 'interrupted')
 
+    def test_native_only_reply_finishes_without_waiting_for_cast_guard(self):
+        def respond(text, *, on_sentence, check):
+            on_sentence("One sentence.")
+            return "One sentence."
+
+        manager = self.manager(respond, guard=60)
+        task_id = self.store.create()["id"]
+        manager.start(task_id, "hello", "en")
+        manager.deliver(task_id, 123, speech_to_native_ms=2500)
+        self.wait(lambda: not manager.jobs)
+        self.player.play.assert_not_called()
+        output = next(s for s in self.store.get(task_id)["stages"] if s["name"] == "output")
+        self.assertEqual(output["status"], "done")
+        self.assertEqual(output["detail"]["speech_to_native_ms"], 2500)
+
     def test_native_delivery_failure_stops_cast(self):
         def respond(text, *, on_sentence, check):
             on_sentence("First.")
@@ -179,10 +194,18 @@ class ReplyStreamTests(unittest.TestCase):
         class QuietHandler(server.Handler):
             def log_message(self, *args):
                 pass
+        cast_assets = self.root / "cast"
+        cast_assets.mkdir()
+        for name in server.CAST_SDK_FILES:
+            (cast_assets / name).touch()
         with patch.object(server, 'TASKS', self.store), \
              patch.object(server, 'STREAMS', manager), \
+             patch.object(server, 'DATA_DIR', self.root), \
              patch.object(server, 'OUTPUT_MODE', 'native'), \
-             patch.object(server, 'streaming_enabled', return_value=True):
+             patch.object(server, 'PLAYER_ENABLED', True), \
+             patch.object(server.PLAYER, 'available', return_value=True), \
+             patch.dict(os.environ, {'LLM_STREAMING': 'auto'}):
+            self.assertFalse(server._streams_native_reply())
             http = ThreadingHTTPServer(('127.0.0.1', 0), QuietHandler)
             worker = threading.Thread(target=http.serve_forever, daemon=True)
             worker.start()
@@ -192,7 +215,7 @@ class ReplyStreamTests(unittest.TestCase):
                 with urlopen(request, timeout=2) as response:
                     return json.load(response)
             try:
-                first = post('/answer', {'text': 'hello', 'lang': 'en'})
+                first = post('/answer', {'text': 'hello', 'lang': 'en', 'native_ack': True})
                 self.assertTrue(first['streaming'])
                 self.assertEqual(first['response'], 'First.')
                 self.assertFalse(gate.is_set())

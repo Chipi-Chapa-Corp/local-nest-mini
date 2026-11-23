@@ -23,7 +23,7 @@ You are a voice assistant named Laylo (pronounced "lejlo"). Respond quickly, bri
 
 # Responding
 - Output only ordinary spoken text. Do not use tags in square brackets, Markdown, stage directions, or other formatting.
-- Prefer concise responses in one or a few sentences.
+- Put the direct answer in a short first sentence. Add more detail only when useful.
 - Use only the request's language and script; translate or transliterate every foreign term, name, abbreviation, and letter into that language.
 - Write numbers and abbreviations as they should be spoken in that language.
 - Speak as a human would: naturally and realistically.
@@ -49,8 +49,9 @@ _history = deque(maxlen=HISTORY_LIMIT)
 _conversation_lock = threading.Lock()
 
 
-def streaming_enabled() -> bool:
-    return os.environ.get("LLM_STREAMING", "0").lower() in {"1", "true", "yes"}
+def streaming_enabled(*, default=False) -> bool:
+    value = os.environ.get("LLM_STREAMING", "auto").strip().lower()
+    return default if value == "auto" else value in {"1", "true", "yes"}
 
 
 def _api_style(base_url):
@@ -121,7 +122,7 @@ def _request_response(messages: list[dict[str, str]], *, on_sentence=None, check
             payload["reasoning"] = {"effort": reasoning}
         else:
             payload["reasoning_effort"] = reasoning
-    if streaming_enabled():
+    if on_sentence is not None or streaming_enabled():
         payload["stream"] = True
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     api_key = os.environ.get("LLM_API_KEY", "").strip()

@@ -251,16 +251,16 @@ class ProcessorTests(unittest.TestCase):
         return b"".join(b"data: " + json.dumps(chunk, ensure_ascii=False).encode() + b"\n\n"
                         for chunk in chunks) + (b"data: [DONE]\n\n" if finish else b"")
 
-    def test_stream_emits_first_line_before_remaining_text_arrives(self):
+    def test_stream_emits_first_sentence_without_waiting_for_newline_or_opt_in(self):
         self.api.content_type = "text/event-stream"
-        self.api.prefix = self.sse({"content": "Привет."}, {"content": "\n"}, finish=None)
+        self.api.prefix = self.sse({"content": "Привет."}, {"content": " "}, finish=None)
         self.api.body = self.sse({"content": "Как дела?\n"})
         heard = threading.Event()
         lines, result = [], []
         def sentence(text):
             lines.append(text)
             heard.set()
-        with patch.dict(os.environ, {"LLM_STREAMING": "1"}):
+        with patch.dict(os.environ, {"LLM_STREAMING": "auto"}):
             worker = threading.Thread(target=lambda: result.append(
                 processor.respond("Привет", on_sentence=sentence)))
             worker.start()
@@ -272,7 +272,7 @@ class ProcessorTests(unittest.TestCase):
             finally:
                 self.api.release.set()
                 worker.join(3)
-        self.assertEqual(result, ["Привет.\nКак дела?"])
+        self.assertEqual(result, ["Привет. Как дела?"])
         self.assertEqual(lines, ["Привет.", "Как дела?"])
         self.assertTrue(self.api.requests[0]["body"]["stream"])
         self.assertEqual(processor._history[-1]["content"], result[0])

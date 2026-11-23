@@ -50,20 +50,20 @@ class _Player:
         except Exception:
             pass
 
-    def play(self, url: str, task_id: str | None = None, *, wait=False, duration=None):
+    def play(self, url: str, task_id: str | None = None, *, wait=False, duration=None, live=False):
         if not ENABLED:
             return {"played": False, "reason": "player disabled"}
         with self._lock:
             TASKS.check(task_id)
             try:
-                result = self._play_locked(url, task_id)
+                result = self._play_locked(url, task_id, live=live)
             except TaskCancelled:
                 self.close()
                 raise
             except Exception:
                 self.close()
                 TASKS.check(task_id)
-                result = self._play_locked(url, task_id)
+                result = self._play_locked(url, task_id, live=live)
             if wait and result.get("played"):
                 try:
                     self._wait_finished(url, task_id, duration)
@@ -96,10 +96,13 @@ class _Player:
         except Exception:
             pass
 
-    def _play_locked(self, url: str, task_id: str | None = None):
+    def _play_locked(self, url: str, task_id: str | None = None, *, live=False):
         cast = self._connect()
         media = cast.media_controller
-        media.play_media(url, "audio/wav")
+        if live:
+            media.play_media(url, "audio/mpeg", stream_type="LIVE")
+        else:
+            media.play_media(url, "audio/wav")
         state = "UNKNOWN"
         for _ in range(int(TIMEOUT / 0.25)):
             time.sleep(0.25)
@@ -118,6 +121,13 @@ class _Player:
         if state == "IDLE" and content_id == url:
             return {"played": True, "state": state, "url": url}
         raise RuntimeError(f"Cast did not start playback: {state}")
+
+    def stop(self, url):
+        with self._lock:
+            if self._cast is not None:
+                media = self._cast.media_controller
+                if media.status.content_id == url:
+                    self._stop_media(media)
 
     def close(self):
         if self._cast is not None:

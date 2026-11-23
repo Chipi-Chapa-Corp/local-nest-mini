@@ -1,0 +1,10 @@
+# Apply on top of local-infra's compose.yml for the AMD Vulkan STT backend.
+services:
+  nest-assistant:
+    image: localhost/local-nest-mini:vulkan
+    build:
+      context: ./services/local-nest-mini
+      dockerfile: Containerfile
+      target: runtime-vulkan
+    devices:
+      - "${NEST_WHISPER_RENDER_DEVICE:-/dev/dri/renderD128}"

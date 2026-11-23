@@ -126,15 +126,18 @@ one final request with tool use disabled. The next user message starts a fresh
 allowance. Tool results are limited to 16 KB each and stay within the current
 response; the shared 50-message history retains user messages and final replies.
 
-Set `LLM_STREAMING=1` in `.env` to stream response text and start speech before
-the whole reply is generated. With `OUTPUT_MODE=native`, the model is instructed
-to put each sentence on its own line and end it with `.`, `!`, or `?`. Completed
-lines are synthesized as they arrive. Silero and Pocket stay loaded in a shared
+`LLM_STREAMING=auto` (the default) starts speech on native Nest turns as soon as
+the first complete sentence is available when Cast is enabled and its receiver
+SDK is cached locally. Set
+`LLM_STREAMING=0` in `.env` to send the full reply as one clip, or `1` to
+explicitly enable streaming for native `/answer` clients that acknowledge delivery.
+The model is instructed to put the direct answer in a short first sentence and
+put each sentence on its own line. Silero and Pocket stay loaded in a shared
 CPU worker across sentences and requests; each sentence becomes a WAV clip.
 The optional OmniVoice GPU backend uses its native `--stream-by-line -o -`
 mode, with per-sentence CPU inference as fallback after a native GPU failure.
-Malformed lines fall back to splitting on sentence punctuation; a final line
-without a newline is flushed at the end of the text stream.
+Sentence punctuation followed by whitespace also releases the sentence without
+waiting for a newline. Any remaining text is flushed when the stream ends.
 
 The first sentence is returned through the normal Nest S3 response. Once its
 delivery is acknowledged, later sentences play through Cast in order. The
@@ -146,6 +149,11 @@ This requires `PLAYER_ENABLED=1` and the offline Cast receiver assets from
 streaming turn supersedes the previous turn's remaining speech. History saves
 the complete final response, and the five-tool budget still applies to the
 whole response. Browser Test pipelines keep their explicit playback controls.
+
+The monitor shows the estimated time from the detected end of speech until the
+first native audio is sent. This includes the trailing silence used to confirm
+the end of speech. The Nest's buffering and speaker playback start happen after
+this measurement.
 
 Research: the [chat streaming API](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)
 emits text deltas rather than sentence events. [OmniVoice's native CLI](https://github.com/ServeurpersoCom/omnivoice.cpp/blob/master/docs/ARCHITECTURE.md)
@@ -209,5 +217,38 @@ image target is separate from the default runtime.
 
 The optional OmniVoice CPU weights and environment remain because
 they provide the fallback when the GPU is busy.
+
+### Azure Voice Live
+
+Set `NEST_VOICE_LIVE=1` in `.env` to stream Nest microphone audio to Azure
+Voice Live and send replies over a single live MP3 Cast stream. Use an Azure
+OpenAI resource in `LLM_BASE_URL` and configure `LLM_MODEL` and `LLM_API_KEY`
+for that resource. This mode requires `PLAYER_ENABLED=1` and the local Cast
+receiver assets. The assistant uses Azure Speech for transcription, Ava
+Multilingual for English speech, and local Silero Xenia for Russian speech.
+Russian replies are synthesized as complete sentences arrive.
+
+The Nest endpointer closes the native turn quietly before Cast playback.
+Tool calls can start Cast with a short localized spoken status. Related
+web searches and source reads share one announcement per turn. If Voice
+Live fails before the answer starts, the assistant tries local transcription
+and the existing text pipeline. Set `NEST_VOICE_LIVE=0` to return to native
+reply playback.
+
+### Optional Vulkan transcription
+
+From local-infra, use the overlay for the assistant container on a machine with a
+Vulkan-capable AMD GPU.
+
+```sh
+NEST_WHISPER_RENDER_DEVICE=/dev/dri/renderD128 \
+  ./scripts/compose.sh -f services/local-nest-mini/compose.vulkan.yml \
+  up -d --build nest-assistant
+```
+
+Check `/dev/dri/by-path/` for the render node of the intended GPU. The overlay
+uses the same local Whisper model and retries the CPU binary on Vulkan failure.
+Pass the overlay on subsequent Compose reconciliations to keep using the Vulkan
+image. The standard systemd unit uses the base Compose file.
 
 License: GPL-3.0, see `LICENSE`.

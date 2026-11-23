@@ -22,6 +22,21 @@ RUN cmake -S /src -B /src/build -G "Unix Makefiles" \
       -DGGML_F16C=ON \
  && cmake --build /src/build --target whisper-cli -j "$(nproc)"
 
+FROM whisper-build AS whisper-vulkan-build
+
+ARG VULKAN_HEADERS_COMMIT=b5c8f996196ba4aa6d8f97e52b5d3b6e70f7e4e2
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libvulkan-dev glslc spirv-headers \
+ && rm -rf /var/lib/apt/lists/*
+
+# Bookworm's packaged headers predate extensions used by this whisper.cpp pin.
+RUN git init /vulkan-headers \
+ && git -C /vulkan-headers fetch --depth=1 https://github.com/KhronosGroup/Vulkan-Headers "$VULKAN_HEADERS_COMMIT" \
+ && git -C /vulkan-headers checkout --detach FETCH_HEAD \
+ && cmake -S /src -B /src/build -DGGML_VULKAN=ON -DVulkan_INCLUDE_DIR=/vulkan-headers/include \
+ && cmake --build /src/build --target whisper-cli -j "$(nproc)"
+
 
 FROM docker.io/library/python:3.12-slim-bookworm AS runtime
 
@@ -59,6 +74,13 @@ RUN mkdir -p /data/streams /data/tts /data/logs
 
 EXPOSE 8099
 CMD ["python", "-m", "app.server"]
+
+FROM runtime AS runtime-vulkan
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=whisper-vulkan-build /src/build/bin/whisper-cli /usr/local/bin/whisper-vulkan
+ENV WHISPER_GPU_BIN=/usr/local/bin/whisper-vulkan
 
 # Optional legacy backend. The normal build stops at the runtime target.
 FROM runtime AS omnivoice

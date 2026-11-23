@@ -1,14 +1,20 @@
 """Incremental sentence boundaries for streamed assistant text."""
 
 
-class SentenceBuffer:
+class LineBuffer:
+    """Emit complete lines or sentences as soon as their boundary is known."""
+
     def __init__(self, emit):
         self.emit = emit
         self.buffer = ""
         self.emitted = 0
 
     def feed(self, text):
-        self.buffer += text
+        pieces = text.split("\n")
+        for line in pieces[:-1]:
+            self.buffer += line
+            self.finish()
+        self.buffer += pieces[-1]
         self._drain(False)
 
     def finish(self):
@@ -47,27 +53,3 @@ class SentenceBuffer:
             start = end
             index = end
         self.buffer = self.buffer[start:]
-
-
-class LineBuffer:
-    """Prefer the model's newlines; punctuation is a fallback for malformed lines."""
-    def __init__(self, emit):
-        self.emit = emit
-        self.buffer = ""
-        self.emitted = 0
-
-    def _line(self, text):
-        sentences = SentenceBuffer(self.emit)
-        sentences.feed(text)
-        sentences.finish()
-        self.emitted += sentences.emitted
-
-    def feed(self, text):
-        self.buffer += text
-        while "\n" in self.buffer:
-            line, self.buffer = self.buffer.split("\n", 1)
-            self._line(line)
-
-    def finish(self):
-        self._line(self.buffer)
-        self.buffer = ""

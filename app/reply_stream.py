@@ -122,10 +122,11 @@ class ReplyStream:
         self.check()
         return self.first
 
-    def native_delivered(self, size):
+    def native_delivered(self, size, **timing):
         if not self.delivered.is_set():
             self.native_bytes = size
             self.delivered_at = time.monotonic()
+            self.owner.store.start(self.task_id, "output", native_sentences=1, **timing)
             self.delivered.set()
 
     def play(self):
@@ -135,17 +136,17 @@ class ReplyStream:
                 self.check()
                 if time.monotonic() > deadline:
                     raise RuntimeError("Native sentence was not delivered")
-            # Delivery confirms transport, not audible completion. Allow the
-            # first clip's duration plus a short device playback guard.
-            start_cast = self.delivered_at + self.first["audio_seconds"] + self.owner.guard
-            while time.monotonic() < start_cast:
-                self.check()
-                self.stopped.wait(min(.1, start_cast - time.monotonic()))
             count = 0
             while True:
                 part = self.take(self.audio)
                 if part is END:
                     break
+                if count == 0:
+                    # Native playback continues on the device after delivery.
+                    start_cast = self.delivered_at + self.first["audio_seconds"] + self.owner.guard
+                    while (remaining := start_cast - time.monotonic()) > 0:
+                        self.check()
+                        self.stopped.wait(min(.1, remaining))
                 result = self.owner.player.play(part["audio_url"], self.task_id,
                                                 wait=True, duration=part["audio_seconds"])
                 if not result.get("played"):
@@ -190,7 +191,7 @@ class ReplyStreams:
             job.fail("process", exc)
             raise
 
-    def deliver(self, task_id, size, error=None):
+    def deliver(self, task_id, size, error=None, **timing):
         with self.lock:
             job = self.jobs.get(task_id)
         if job is None:
@@ -198,7 +199,7 @@ class ReplyStreams:
         if error:
             job.fail("output", RuntimeError(error))
         else:
-            job.native_delivered(size)
+            job.native_delivered(size, **timing)
         return True
 
     def finished(self, job):

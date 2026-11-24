@@ -35,7 +35,7 @@ class MonitorTests(unittest.TestCase):
         self.player.play.return_value = {"played": True}
         self.tests = TestPipeline(
             self.store, transcribe=self.transcribe,
-            respond=lambda text: "I have heard: " + text,
+            respond=lambda text, *, task_id: "I have heard: " + text,
             synthesize=self.synthesize, urls=lambda path: {
                 "audio_path": str(path), "audio_url": "http://local/tts/reply.wav"},
             player=self.player, data_dir=self.root,

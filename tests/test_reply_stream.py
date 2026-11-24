@@ -75,7 +75,7 @@ class ReplyStreamTests(unittest.TestCase):
 
     def test_first_sentence_returns_early_then_casts_without_overlap(self):
         release_text, release_cast, casting = threading.Event(), threading.Event(), threading.Event()
-        def respond(text, *, on_sentence, check):
+        def respond(text, *, on_sentence, check, task_id):
             on_sentence("First.")
             while not release_text.wait(.01):
                 check()
@@ -118,7 +118,7 @@ class ReplyStreamTests(unittest.TestCase):
 
     def test_interruption_during_cast_drops_remaining_sentences(self):
         casting = threading.Event()
-        def respond(text, *, on_sentence, check):
+        def respond(text, *, on_sentence, check, task_id):
             for line in ("First.", "Second.", "Third."):
                 on_sentence(line)
             return "First. Second. Third."
@@ -139,7 +139,7 @@ class ReplyStreamTests(unittest.TestCase):
         self.assertEqual(self.store.get(task['id'])['status'], 'interrupted')
 
     def test_native_only_reply_finishes_without_waiting_for_cast_guard(self):
-        def respond(text, *, on_sentence, check):
+        def respond(text, *, on_sentence, check, task_id):
             on_sentence("One sentence.")
             return "One sentence."
 
@@ -154,7 +154,7 @@ class ReplyStreamTests(unittest.TestCase):
         self.assertEqual(output["detail"]["speech_to_native_ms"], 2500)
 
     def test_native_delivery_failure_stops_cast(self):
-        def respond(text, *, on_sentence, check):
+        def respond(text, *, on_sentence, check, task_id):
             on_sentence("First.")
             on_sentence("Second.")
             return "First. Second."
@@ -167,7 +167,7 @@ class ReplyStreamTests(unittest.TestCase):
         self.assertEqual(self.store.get(task['id'])['error']['message'], 'connection lost')
 
     def test_synthesis_failure_is_reported_before_http_reply(self):
-        def respond(text, *, on_sentence, check):
+        def respond(text, *, on_sentence, check, task_id):
             on_sentence("First.")
             return "First."
         def clips(*args):
@@ -184,7 +184,7 @@ class ReplyStreamTests(unittest.TestCase):
         with patch.dict(os.environ, {"DATA_DIR": str(self.root)}):
             from app import server
         gate = threading.Event()
-        def respond(text, *, on_sentence, check):
+        def respond(text, *, on_sentence, check, task_id):
             on_sentence("First.")
             while not gate.wait(.01):
                 check()

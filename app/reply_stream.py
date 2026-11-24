@@ -66,7 +66,7 @@ class ReplyStream:
         try:
             self.owner.store.start(self.task_id, "process", text=self.text, streaming=True)
             reply = self.owner.respond(self.text, on_sentence=lambda line: self.put(self.lines, line),
-                                       check=self.check)
+                                       check=self.check, task_id=self.task_id)
             self.check()
             self.owner.store.finish(self.task_id, "process", response=reply, streaming=True)
             self.put(self.lines, END)
@@ -76,6 +76,8 @@ class ReplyStream:
     def synthesize(self):
         try:
             count = 0
+            started = time.monotonic()
+            metrics = {"local": True, "audio_seconds": 0}
             input_ended = False
             self.owner.store.start(self.task_id, "tts", streaming=True)
 
@@ -98,18 +100,30 @@ class ReplyStream:
                     raise RuntimeError("Could not determine sentence audio duration")
                 if count == 1:
                     part["audio_ogg_path"] = str(self.owner.transcode(path, self.task_id))
+                    metrics["first_chunk_seconds"] = time.monotonic() - started
                     self.first = {"input": self.text, "task_id": self.task_id, "streaming": True, **part}
                     self.owner.store.start(self.task_id, "output", transport="native+cast", streaming=True)
                     self.ready.set()
                 else:
                     self.put(self.audio, part)
+                metrics["audio_seconds"] += part["audio_seconds"]
+                self._update_peaks(metrics)
                 self.owner.store.start(self.task_id, "tts", sentences=count, streaming=True)
             if not count:
                 raise RuntimeError("No speech was generated")
-            self.owner.store.finish(self.task_id, "tts", sentences=count, streaming=True)
+            self._update_peaks(metrics)
+            metrics["total_seconds"] = time.monotonic() - started
+            self.owner.store.finish(self.task_id, "tts", sentences=count, streaming=True,
+                                    metrics=metrics)
             self.put(self.audio, END)
         except Exception as exc:
             self.fail("tts", exc)
+
+    def _update_peaks(self, metrics):
+        details = self.owner.store.detail(self.task_id, "tts").get("metrics", {})
+        for key in ("peak_rss_mib", "peak_vram_mib"):
+            if key in details:
+                metrics[key] = max(metrics.get(key, 0), details[key])
 
     def first_reply(self):
         deadline = time.monotonic() + 300

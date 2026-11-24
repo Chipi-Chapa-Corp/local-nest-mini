@@ -27,6 +27,7 @@ from .processor import respond, streaming_enabled
 from .reply_stream import ReplyStreams
 from .omnivoice_stream import NativeStreamError, stream_lines
 from .tasks import TASKS, TaskCancelled
+from .telemetry import ProcessPeak
 from .test_pipeline import TestPipeline
 from .voice_live import enabled as voice_live_enabled
 
@@ -98,10 +99,10 @@ def _stop_process(proc) -> None:
             pass
 
 
-def _run(cmd, *, timeout, stdin=None, task_id=None):
+def _run(cmd, *, timeout, stdin=None, task_id=None, memory=None, gpu=False):
     TASKS.check(task_id)
     argv = [str(part) for part in cmd]
-    if not task_id:
+    if not task_id and memory is None:
         return subprocess.run(
             argv,
             input=stdin,
@@ -116,20 +117,24 @@ def _run(cmd, *, timeout, stdin=None, task_id=None):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    peak = ProcessPeak(proc.pid, gpu=gpu) if memory is not None else None
     TASKS.register_process(task_id, proc)
     try:
         if stdin is not None:
             proc.stdin.write(stdin)
             proc.stdin.close()
+            proc.stdin = None
         deadline = time.monotonic() + timeout
         while True:
             TASKS.check(task_id)
+            if peak is not None:
+                peak.sample()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _stop_process(proc)
                 raise subprocess.TimeoutExpired(argv, timeout)
             try:
-                stdout, stderr = proc.communicate(timeout=min(0.2, remaining))
+                stdout, stderr = proc.communicate(timeout=min(.05 if peak else .2, remaining))
                 break
             except subprocess.TimeoutExpired:
                 continue
@@ -139,6 +144,8 @@ def _run(cmd, *, timeout, stdin=None, task_id=None):
         _stop_process(proc)
         raise
     finally:
+        if peak is not None:
+            memory.update(peak.metrics)
         TASKS.unregister_process(task_id, proc)
         for pipe in (proc.stdin, proc.stdout, proc.stderr):
             if pipe is not None and not pipe.closed:
@@ -178,6 +185,8 @@ def _prepare_audio(source: Path, destination: Path, task_id: str | None = None):
 def transcribe_audio(source: Path, lang: str = "auto", task_id: str | None = None) -> str:
     if not STT_MODEL.is_file():
         raise RuntimeError(f"STT model missing: {STT_MODEL}")
+    started = time.monotonic()
+    memory = {} if task_id else None
     with tempfile.TemporaryDirectory(prefix="stt-") as temp:
         temp = Path(temp)
         wav = temp / "input.wav"
@@ -192,11 +201,13 @@ def transcribe_audio(source: Path, lang: str = "auto", task_id: str | None = Non
         result = None
         if WHISPER_GPU_BIN:
             try:
-                result = _run([WHISPER_GPU_BIN, *args], timeout=10, task_id=task_id)
+                result = _run([WHISPER_GPU_BIN, *args], timeout=10, task_id=task_id,
+                              memory=memory, gpu=True)
             except (OSError, subprocess.TimeoutExpired):
                 pass
         if result is None or result.returncode:
-            result = _run([WHISPER_BIN, *args], timeout=300, task_id=task_id)
+            memory = {} if task_id else None
+            result = _run([WHISPER_BIN, *args], timeout=300, task_id=task_id, memory=memory)
         if result.returncode:
             raise RuntimeError(result.stderr.decode(errors="replace").strip() or "whisper failed")
         lines = []
@@ -205,6 +216,12 @@ def transcribe_audio(source: Path, lang: str = "auto", task_id: str | None = Non
             if line and not line.startswith(("whisper_", "system_info:", "main:")):
                 lines.append(line)
         text = " ".join(lines).strip()
+        if task_id:
+            elapsed = time.monotonic() - started
+            TASKS.start(task_id, "transcribe", metrics={
+                "local": True, "audio_seconds": duration, "first_chunk_seconds": elapsed,
+                "total_seconds": elapsed, **memory,
+            })
         return text or ""
 
 
@@ -259,6 +276,7 @@ def _synthesize_omnivoice_gpu(text, lang, output, task_id, free_mib):
     """Run omnivoice.cpp on Vulkan; return its metrics or raise."""
     from .omnivoice_tts import REFERENCE_TEXT
     reference_rvq = OMNIVOICE_REFERENCE.with_suffix(".rvq")
+    memory = {}
     with tempfile.TemporaryDirectory(prefix="omnivoice-gpu-") as temp:
         ref_text = Path(temp) / "reference.txt"
         ref_text.write_text(REFERENCE_TEXT)
@@ -270,7 +288,7 @@ def _synthesize_omnivoice_gpu(text, lang, output, task_id, free_mib):
             "--model", OMNIVOICE_GPU_MODEL, "--codec", OMNIVOICE_GPU_CODEC,
             "--lang", lang, *reference, "--ref-text", ref_text,
             "--seed", "1234", "--steps", OMNIVOICE_GPU_STEPS, "-o", output,
-        ], timeout=120, stdin=text.encode(), task_id=task_id)
+        ], timeout=120, stdin=text.encode(), task_id=task_id, memory=memory, gpu=True)
         wall = time.monotonic() - started
     log = (result.stdout + result.stderr).decode(errors="replace")
     if result.returncode or not output.is_file() or output.stat().st_size <= 44:
@@ -284,7 +302,7 @@ def _synthesize_omnivoice_gpu(text, lang, output, task_id, free_mib):
                 load_seconds=round(wall - generation, 3), generation_seconds=round(generation, 3),
                 audio_seconds=round(audio_seconds, 3),
                 rtf=round(generation / audio_seconds, 3) if audio_seconds else None,
-                vram_free_mib=round(free_mib))
+                vram_free_mib=round(free_mib), **memory)
 
 
 def _synthesize_omnivoice(text, lang, output, task_id, cpu_only_reason=None):
@@ -357,6 +375,7 @@ def synthesize(text: str, lang: str = "en", task_id: str | None = None, *, cpu_o
     if lang not in {"en", "ru"}:
         raise ValueError("lang must be en or ru")
     output = TTS_DIR / f"reply-{uuid.uuid4().hex}.wav"
+    started = time.monotonic()
     if TTS_BACKEND == "silero_pocket":
         text = _strip_sound_tags(text)
         if not text:
@@ -374,6 +393,12 @@ def synthesize(text: str, lang: str = "en", task_id: str | None = None, *, cpu_o
     else:
         _synthesize_omnivoice(text, lang, output, task_id)
     output.chmod(0o644)
+    if task_id:
+        detail = TASKS.detail(task_id, "tts")
+        metrics = detail.get("metrics", {})
+        elapsed = time.monotonic() - started
+        metrics.update(local=True, total_seconds=elapsed, first_chunk_seconds=elapsed)
+        TASKS.start(task_id, "tts", metrics=metrics)
     return output
 
 
@@ -448,9 +473,11 @@ def synthesize_lines(next_line, lang, task_id):
                            "--stream-by-line", "--format", "wav16", "-o", "-"]
                 TASKS.start(task_id, "tts", engine="OmniVoice GPU (native line stream)",
                             vram_free_mib=round(free))
+                memory = {}
                 try:
                     yield from stream_lines(command, speech_line, store=TASKS, task_id=task_id,
-                                            output_dir=TTS_DIR)
+                                            output_dir=TTS_DIR, memory=memory)
+                    TASKS.start(task_id, "tts", metrics={"local": True, **memory})
                     return
                 except NativeStreamError as exc:
                     pending = exc.pending
@@ -725,7 +752,7 @@ class Handler(BaseHTTPRequestHandler):
                 text = str(data.get("input", "")).strip()
                 stage = "process"
                 TASKS.start(task_id, stage)
-                response = respond(text)
+                response = respond(text, task_id=task_id)
                 TASKS.check(task_id)
                 TASKS.finish(task_id, stage, input=text, response=response)
                 self._json(200, {"input": text, "response": response, "task_id": task_id})
@@ -754,7 +781,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 stage = "process"
                 TASKS.start(task_id, stage, text=text, lang=lang)
-                reply = respond(text)
+                reply = respond(text, task_id=task_id)
                 TASKS.check(task_id)
                 TASKS.finish(task_id, stage, response=reply)
                 stage = "tts"
@@ -788,7 +815,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 stage = "process"
                 TASKS.start(task_id, stage, text=text)
-                reply = respond(text)
+                reply = respond(text, task_id=task_id)
                 TASKS.check(task_id)
                 TASKS.finish(task_id, stage, response=reply)
                 result = {"input": text, "response": reply, "lang": lang, "task_id": task_id}

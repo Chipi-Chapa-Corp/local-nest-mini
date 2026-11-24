@@ -7,13 +7,20 @@ import time
 from urllib.parse import urlencode, urlsplit
 
 from . import processor, web_tools
-from .sentences import LineBuffer
+from .telemetry import combine_usage, voice_usage
 
 TOOL_LABELS = {
     "web_search": {"en": "Searching the web.", "ru": "Ищу в интернете."},
     "read_web_page": {"en": "Checking sources.", "ru": "Проверяю источники."},
 }
 AZURE_VOICE = "en-US-AvaMultilingualNeural"
+RUSSIAN_VOICE = {
+    "type": "azure-standard",
+    "name": "en-US-Harper:MAI-Voice-2.1-Flash",
+    "style": "narrator",
+}
+MULTILINGUAL_SPEECH_RULES = """- Answer in the request's language. Keep foreign names, technical terms, and acronyms in their original spelling and script.
+- Write numbers as they should be spoken in the request's language."""
 
 
 def enabled():
@@ -34,6 +41,7 @@ class VoiceLive:
         import websocket
 
         self.lang, self.check = lang, check
+        self.metrics = {}
         self.timeout = websocket.WebSocketTimeoutException
         self.tools = web_tools.TOOL_DEFINITIONS if web_tools.available() else []
         self.ws = websocket.create_connection(
@@ -101,45 +109,86 @@ class VoiceLive:
                        "text": message["content"]}
             self.send("conversation.item.create", item={"type": "message", "role": role,
                                                         "content": [content]})
+        started = time.monotonic()
+        first = None
         self.send("input_audio_buffer.commit")
         for event in self.events(15):
             match event["type"]:
+                case "conversation.item.input_audio_transcription.delta":
+                    if event.get("delta") and first is None:
+                        first = time.monotonic() - started
                 case "conversation.item.input_audio_transcription.completed":
+                    total = time.monotonic() - started
+                    self.metrics["transcribe"] = {
+                        "cloud": True, "total_seconds": total,
+                        "first_chunk_seconds": total if first is None else first,
+                    }
                     return event.get("transcript", "").strip()
                 case "conversation.item.input_audio_transcription.failed":
                     raise RuntimeError("Azure Voice Live transcription failed")
 
-    def respond(self, lang, *, on_audio, on_sentence, on_tool):
+    def respond(self, lang, *, on_audio, on_tool):
         tools_left = processor.MAX_TOOL_CALLS if self.tools else 0
         announced = False
+        settings = {"modalities": ["text", "audio"]}
+        if lang == "ru":
+            instructions = processor.SYSTEM_PROMPT.replace(
+                processor.LOCAL_SPEECH_RULES, MULTILINGUAL_SPEECH_RULES)
+            if self.tools:
+                instructions += processor.TOOL_INSTRUCTIONS
+            settings.update(voice=RUSSIAN_VOICE, instructions=instructions)
+        self.metrics = getattr(self, "metrics", {})
+        entries = []
+        started = time.monotonic()
+        first_text = None
         while True:
+            request_started = time.monotonic()
             self.send("response.create", response={
-                "modalities": ["text"] if lang == "ru" else ["text", "audio"],
+                **settings,
                 "tool_choice": "auto" if tools_left else "none",
             })
             words = []
-            sentences = LineBuffer(on_sentence) if lang == "ru" else None
+            first_audio = last_audio = text_done = None
+            audio_bytes = 0
             for event in self.events():
                 kind = event["type"]
                 if kind in {"response.audio.delta", "response.output_audio.delta"}:
-                    on_audio(base64.b64decode(event["delta"]))
-                elif kind in {"response.text.delta", "response.output_text.delta",
-                              "response.audio_transcript.delta", "response.output_audio_transcript.delta"}:
-                    if (sentences is None) != ("audio_transcript" in kind):
-                        continue
-                    text = event["delta"]
-                    words.append(text)
-                    if sentences:
-                        sentences.feed(text)
+                    audio = base64.b64decode(event["delta"])
+                    if audio:
+                        last_audio = time.monotonic()
+                        if first_audio is None:
+                            first_audio = last_audio
+                        audio_bytes += len(audio)
+                        on_audio(audio)
+                elif kind in {"response.audio_transcript.delta", "response.output_audio_transcript.delta"}:
+                    words.append(event["delta"])
+                    if first_text is None and event["delta"]:
+                        first_text = time.monotonic()
+                elif kind in {"response.audio_transcript.done", "response.output_audio_transcript.done"}:
+                    text_done = time.monotonic()
                 elif kind == "response.done":
                     response = event["response"]
                     if response["status"] != "completed":
                         raise RuntimeError(f"Azure Voice Live response {response['status']}")
                     break
+            entries.append(voice_usage(response, os.environ.get("LLM_MODEL", "")))
             calls = [item for item in response.get("output", []) if item["type"] == "function_call"]
             if not calls:
-                if sentences:
-                    sentences.finish()
+                done = time.monotonic()
+                for stage in ("transcribe", "process", "tts"):
+                    self.metrics.setdefault(stage, {}).update(
+                        cloud=True, **combine_usage([entry[stage] for entry in entries]))
+                self.metrics["process"].update(
+                    total_seconds=(text_done or done) - started,
+                    first_chunk_seconds=(first_text or text_done or done) - started,
+                )
+                if first_audio is not None:
+                    self.metrics["tts"].update(
+                        first_chunk_seconds=first_audio - request_started,
+                        total_seconds=last_audio - request_started,
+                        audio_seconds=audio_bytes / 48000,
+                        timing_scope="Audio measured from the Azure response request",
+                    )
                 return "".join(words).strip()
             if not tools_left:
                 raise RuntimeError("Azure Voice Live requested tools after reaching the tool limit")

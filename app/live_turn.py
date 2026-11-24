@@ -3,6 +3,7 @@
 import threading
 from pathlib import Path
 import tempfile
+import time
 import wave
 
 from . import processor
@@ -77,16 +78,34 @@ class LiveTurns:
             stage = "transcribe"
             self.store.start(task_id, stage, engine="Azure Speech" if voice else "Whisper")
             answer_started = False
+            local_audio_bytes = 0
+            local_started = local_first = local_done = None
+            local_peaks = {}
 
             def append_answer(audio):
                 nonlocal answer_started
                 if audio:
+                    if not answer_started and voice:
+                        engine = "Azure / Harper Narrator" if lang == "ru" else "Azure / Ava"
+                        self.store.start(task_id, "tts", engine=engine)
                     answer_started = True
                     stream.append(audio)
 
             def speak(text):
+                nonlocal local_audio_bytes, local_started, local_first, local_done
+                if local_started is None:
+                    local_started = time.monotonic()
                 self.store.start(task_id, "tts", engine="Silero / Xenia" if lang == "ru" else "Pocket / Alba")
-                append_answer(self.speak_pcm(text, lang, task_id))
+                audio = self.speak_pcm(text, lang, task_id)
+                local_audio_bytes += len(audio)
+                local_done = time.monotonic()
+                if local_first is None:
+                    local_first = local_done
+                metrics = self.store.detail(task_id, "tts").get("metrics", {})
+                for key in ("peak_rss_mib", "peak_vram_mib"):
+                    if key in metrics:
+                        local_peaks[key] = max(local_peaks.get(key, 0), metrics[key])
+                append_answer(audio)
 
             def announce(name):
                 labels = TOOL_LABELS[name]
@@ -104,13 +123,18 @@ class LiveTurns:
                             self.store.skip(task_id, "output", "empty transcript")
                             return
                         lang = reply_language(lang, query)
-                        self.store.finish(task_id, stage, text=query, lang=lang)
+                        input_seconds = len(pcm) / 32000
+                        self.store.finish(task_id, stage, text=query, lang=lang,
+                                          metrics={**voice.metrics["transcribe"], "audio_seconds": input_seconds})
                         stage = "process"
                         self.store.start(task_id, stage, text=query, engine="Azure Voice Live")
-                        reply = voice.respond(lang, on_audio=append_answer, on_sentence=speak, on_tool=announce)
+                        reply = voice.respond(lang, on_audio=append_answer, on_tool=announce)
                         if not answer_started:
                             raise RuntimeError("Azure Voice Live returned no audio")
                         check()
+                        self.store.update_detail(task_id, "transcribe", metrics={
+                            **voice.metrics["transcribe"], "audio_seconds": input_seconds,
+                        })
                         if reply:
                             processor._history.extend(({"role": "user", "content": query},
                                                        {"role": "assistant", "content": reply}))
@@ -139,10 +163,20 @@ class LiveTurns:
                 lang = reply_language(lang, query)
                 stage = "process"
                 self.store.start(task_id, stage, text=query, engine="Responses fallback")
-                reply = processor.respond(query, check=check, on_sentence=speak)
-            self.store.finish(task_id, "process", response=reply, lang=lang)
-            self.store.finish(task_id, "tts", engine="Silero / Xenia" if lang == "ru"
-                              else ("Azure / Ava" if voice else "Pocket / Alba"))
+                reply = processor.respond(query, check=check, on_sentence=speak, task_id=task_id)
+            if voice:
+                engine = "Azure / Harper Narrator" if lang == "ru" else "Azure / Ava"
+                self.store.finish(task_id, "process", response=reply, lang=lang,
+                                  metrics=voice.metrics["process"])
+                self.store.finish(task_id, "tts", engine=engine, metrics=voice.metrics["tts"])
+            else:
+                engine = "Silero / Xenia" if lang == "ru" else "Pocket / Alba"
+                self.store.finish(task_id, "process", response=reply, lang=lang)
+                metrics = {"local": True, **local_peaks, "audio_seconds": local_audio_bytes / 48000}
+                if local_started is not None:
+                    metrics.update(first_chunk_seconds=local_first - local_started,
+                                   total_seconds=local_done - local_started)
+                self.store.finish(task_id, "tts", engine=engine, metrics=metrics)
             stage = "output"
             result = stream.close()
             check()

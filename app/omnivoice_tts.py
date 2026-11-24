@@ -107,6 +107,7 @@ def main():
             audio_seconds=round(duration, 3), rtf=round(generation_seconds/duration, 3),
             cpu_seconds=round(cpu_seconds, 3), average_cpu_cores=round(cpu_seconds/generation_seconds, 2),
             peak_rss_mib=round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024, 1),
+            peak_vram_mib=0,
             sample_rate=model.sampling_rate)
         print(json.dumps(report), flush=True)
     except BaseException:

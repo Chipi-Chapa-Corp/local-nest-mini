@@ -61,7 +61,7 @@ class TestPipeline:
             self.store.finish(task_id, stage, text=text)
             stage = "process"
             self.store.start(task_id, stage)
-            response = self.respond(text)
+            response = self.respond(text, task_id=task_id)
             lang = "ru" if any("\u0400" <= c <= "\u04ff" for c in response) else "en"
             self.store.check(task_id)
             self.store.finish(task_id, stage, response=response, lang=lang)

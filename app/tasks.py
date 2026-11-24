@@ -176,5 +176,24 @@ class TaskStore:
             task = self._tasks.get(task_id)
             return copy.deepcopy(task) if task else None
 
+    def detail(self, task_id: str, name: str) -> dict:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task:
+                for stage in task["stages"]:
+                    if stage["name"] == name:
+                        return copy.deepcopy(stage["detail"])
+            return {}
+
+    def update_detail(self, task_id: str, name: str, **detail) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task:
+                for stage in task["stages"]:
+                    if stage["name"] == name:
+                        stage["detail"].update(detail)
+                        self._recompute(task)
+                        break
+
 
 TASKS = TaskStore()

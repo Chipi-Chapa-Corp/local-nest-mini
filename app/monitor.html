@@ -118,6 +118,40 @@ function q(text){const t=String(text??""),s=t.length>70?t.slice(0,68).trimEnd()+
 function clock(ts){return new Date(ts*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"})}
 function secs(a,b){return Number.isFinite(a)&&Number.isFinite(b)?`${Math.max(0,b-a).toFixed(1)} s`:""}
 
+function metricSeconds(value){return Number.isFinite(value)&&value>=0?`${value.toFixed(2)} s`:""}
+function memoryMetric(value,kind){
+  if(!Number.isFinite(value)||value<0)return `Peak ${kind} unavailable`;
+  const size=value>=1024?`${(value/1024).toFixed(2)} GiB`:`${Math.round(value)} MiB`;
+  return `${size} peak ${kind}`;
+}
+function stageMetrics(stage){
+  const m=stage?.detail?.metrics;
+  if(!m)return "";
+  const fields=[];
+  const elapsed=Number.isFinite(stage.started)&&Number.isFinite(stage.ended)?stage.ended-stage.started:undefined;
+  const measured=Number.isFinite(m.generation_seconds)?
+    m.generation_seconds+(Number.isFinite(m.load_seconds)?m.load_seconds:0):undefined;
+  const total=metricSeconds(m.total_seconds??measured??elapsed);
+  const first=metricSeconds(m.first_chunk_seconds);
+  const audio=metricSeconds(m.audio_seconds);
+  if(first)fields.push(`${first} until stream`);
+  if(total)fields.push(`${total} total${audio?` for ${audio} audio`:""}`);
+  else if(audio)fields.push(`${audio} audio`);
+  const local=m.local??(!m.cloud&&stage.name==="tts");
+  if(local){
+    fields.push(memoryMetric(m.peak_rss_mib,"RAM"),memoryMetric(m.peak_vram_mib,"VRAM"));
+  }else if(Number.isFinite(m.cost_usd)&&m.cost_usd>=0){
+    const cost=m.cost_usd>0&&m.cost_usd<0.00001?m.cost_usd.toPrecision(3):m.cost_usd.toFixed(5);
+    const usage=Object.entries(m.usage||{}).filter(([,v])=>Number.isFinite(v))
+      .map(([key,value])=>`${value} ${key.replaceAll("_"," ")}`).join(", ");
+    const label=m.cost_estimated?"Estimated from published USD rates":"Provider-reported cost";
+    fields.push(`<span title="${esc([label,usage].filter(Boolean).join(" · "))}">${m.cost_estimated?"≈":""}$${cost}</span>`);
+  }else if(m.cloud){
+    fields.push("Cost unavailable");
+  }
+  return fields.length?`<div class="hint"${m.timing_scope?` title="${esc(m.timing_scope)}"`:""}>${fields.join(" · ")}</div>`:"";
+}
+
 function steps(task){
   const by=Object.fromEntries((task.stages||[]).map(s=>[s.name,s]));
   const test=task.meta?.source==="browser_test";
@@ -143,13 +177,9 @@ function steps(task){
     if(!test&&name==="output"&&Number.isFinite(out.speech_to_native_ms)){
       controls=`<div class="hint">First audio sent about ${secs(0,out.speech_to_native_ms/1000)} after speech ended</div>`;
     }
-    if(name==="tts"&&tts.metrics){
-      const m=tts.metrics;
-      const memory=m.vram_free_mib!=null?`${esc(m.vram_free_mib)} MiB VRAM free`:`${esc(m.peak_rss_mib)} MiB peak RAM`;
-      const steps=m.steps?` · ${esc(m.steps)} steps`:"";
-      controls=`<div class="hint">${esc((m.load_seconds+m.generation_seconds).toFixed(1))} s total · ${esc(m.audio_seconds)} s audio${steps} · ${memory}</div>`;
-      if(tts.cpu_reason&&m.vram_free_mib==null)controls+=`<div class="hint">CPU because ${esc(tts.cpu_reason)}</div>`;
-    }
+    if(["transcribe","process","tts"].includes(name))controls=stageMetrics(st);
+    if(name==="tts"&&tts.cpu_reason&&tts.metrics?.vram_free_mib==null)
+      controls+=`<div class="hint">CPU because ${esc(tts.cpu_reason)}</div>`;
     if(test&&!task.interrupt_requested&&name==="received"&&st?.status==="waiting"){
       const active=state.recording?.id===task.id,starting=state.starting===task.id;
       if(active){cls="recording";label="Recording…";}
@@ -162,7 +192,8 @@ function steps(task){
       if(playing)label="Playing in browser…";
       if(out.last_error)controls+=`<div class="notice" role="status">${esc(out.last_error)}</div>`;
     }
-    const duration=st&&st.status!=="skipped"?secs(st.started,st.ended??Date.now()/1000):"";
+    const duration=st&&st.status!=="skipped"&&!(st.status==="done"&&st.detail?.metrics)?
+      secs(st.started,st.ended??Date.now()/1000):"";
     return {cls,label,controls,duration,glyph:cls==="loading"?"loader-circle":glyph};
   });
 }

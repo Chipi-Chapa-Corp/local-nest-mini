@@ -5,6 +5,7 @@ from contextlib import redirect_stdout
 import json
 import os
 from pathlib import Path
+import resource
 import sys
 import time
 
@@ -84,7 +85,9 @@ def main():
             send({"ok": True, "engine": "Silero v5.6 / Xenia" if lang == "ru" else "Pocket TTS 2M / Alba",
                   "language": lang, "threads": args.threads,
                   "generation_seconds": round(generation, 4), "first_chunk_seconds": round(first, 4),
-                  "audio_seconds": round(seconds, 4), "rtf": round(generation / seconds, 4)})
+                  "audio_seconds": round(seconds, 4), "rtf": round(generation / seconds, 4),
+                  "peak_rss_mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+                  "peak_vram_mib": 0})
         except Exception as exc:
             if output is not None:
                 output.unlink(missing_ok=True)

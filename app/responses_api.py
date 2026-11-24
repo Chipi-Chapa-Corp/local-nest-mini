@@ -20,6 +20,9 @@ def message(result):
                     texts.append(part["text"])
     normalized = {"role": "assistant", "content": "".join(texts),
                   "response_output": result["output"]}
+    for key in ("usage", "cost_usd"):
+        if key in result:
+            normalized[key] = result[key]
     if calls:
         normalized["tool_calls"] = calls
     return normalized

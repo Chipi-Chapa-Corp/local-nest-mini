@@ -11,6 +11,7 @@ import time
 import uuid
 
 from .tasks import TaskCancelled
+from .telemetry import ProcessPeak
 
 
 class NativeStreamError(RuntimeError):
@@ -19,7 +20,7 @@ class NativeStreamError(RuntimeError):
         self.pending = pending
 
 
-def stream_lines(command, next_line, *, store, task_id, output_dir, timeout=120):
+def stream_lines(command, next_line, *, store, task_id, output_dir, timeout=120, memory=None):
     """Keep one model process for the reply, repairing live WAV sizes per clip.
 
     Native output uses an identical 44-byte live WAV header at every line.
@@ -33,6 +34,7 @@ def stream_lines(command, next_line, *, store, task_id, output_dir, timeout=120)
     with tempfile.TemporaryFile() as log:
         proc = subprocess.Popen(list(map(str, command)), stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=log)
+        peak = ProcessPeak(proc.pid, gpu=True) if memory is not None else None
         store.register_process(task_id, proc)
 
         def feed():
@@ -81,6 +83,8 @@ def stream_lines(command, next_line, *, store, task_id, output_dir, timeout=120)
                 deadline = time.monotonic() + timeout
                 while True:
                     store.check(task_id)
+                    if peak is not None:
+                        peak.sample()
                     if stop.is_set():
                         raise TaskCancelled("stream stopped")
                     if feed_errors:
@@ -127,6 +131,8 @@ def stream_lines(command, next_line, *, store, task_id, output_dir, timeout=120)
             with lock:
                 raise NativeStreamError(str(exc), list(pending)) from exc
         finally:
+            if peak is not None:
+                memory.update(peak.metrics)
             stop.set()
             if proc.poll() is None:
                 store._stop(proc)

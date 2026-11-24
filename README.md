@@ -224,9 +224,11 @@ Set `NEST_VOICE_LIVE=1` in `.env` to stream Nest microphone audio to Azure
 Voice Live and send replies over a single live MP3 Cast stream. Use an Azure
 OpenAI resource in `LLM_BASE_URL` and configure `LLM_MODEL` and `LLM_API_KEY`
 for that resource. This mode requires `PLAYER_ENABLED=1` and the local Cast
-receiver assets. The assistant uses Azure Speech for transcription, Ava
-Multilingual for English speech, and local Silero Xenia for Russian speech.
-Russian replies are synthesized as complete sentences arrive.
+receiver assets. The assistant uses Azure Speech for transcription and streams
+Ava Multilingual for English replies and Harper 2.1 Flash in narrator style
+for Russian replies. Russian Voice Live replies preserve the spelling of
+foreign names, technical terms, and acronyms. The local speech models generate
+tool announcements and speak fallback replies.
 
 The Nest endpointer closes the native turn quietly before Cast playback.
 Tool calls can start Cast with a short localized spoken status. Related

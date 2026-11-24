@@ -3,17 +3,22 @@
 import json
 import os
 import threading
+import time
 from collections import deque
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-from .tasks import TaskCancelled
+from .tasks import TASKS, TaskCancelled
+from .telemetry import combine_usage, text_usage
 from .sentences import LineBuffer
 from . import web_tools, responses_api
 
 
-SYSTEM_PROMPT = """# You
+LOCAL_SPEECH_RULES = """- Use only the request's language and script; translate or transliterate every foreign term, name, abbreviation, and letter into that language.
+- Write numbers and abbreviations as they should be spoken in that language."""
+
+SYSTEM_PROMPT = f"""# You
 You are a voice assistant named Laylo (pronounced "lejlo"). Respond quickly, briefly, and write only text suitable for speaking aloud.
 
 # Understanding the user
@@ -24,8 +29,7 @@ You are a voice assistant named Laylo (pronounced "lejlo"). Respond quickly, bri
 # Responding
 - Output only ordinary spoken text. Do not use tags in square brackets, Markdown, stage directions, or other formatting.
 - Put the direct answer in a short first sentence. Add more detail only when useful.
-- Use only the request's language and script; translate or transliterate every foreign term, name, abbreviation, and letter into that language.
-- Write numbers and abbreviations as they should be spoken in that language.
+{LOCAL_SPEECH_RULES}
 - Speak as a human would: naturally and realistically.
 - End every sentence with a period, exclamation mark, or question mark.
 - Put each complete sentence on its own line, followed by a newline, so it can be spoken immediately.
@@ -63,7 +67,7 @@ def _api_style(base_url):
     return style
 
 
-def respond(text: str, *, on_sentence=None, check=None) -> str:
+def respond(text: str, *, on_sentence=None, check=None, task_id=None) -> str:
     text = (text or "").strip()
     if not text:
         raise ValueError("input must not be empty")
@@ -74,7 +78,9 @@ def respond(text: str, *, on_sentence=None, check=None) -> str:
                 check()
             user_message = {"role": "user", "content": text}
             messages = [*list(_history)[-(HISTORY_LIMIT - 1):], user_message]
-            if on_sentence is None and check is None:
+            if task_id is not None:
+                reply = _request_response(messages, on_sentence=on_sentence, check=check, task_id=task_id)
+            elif on_sentence is None and check is None:
                 reply = _request_response(messages)
             else:
                 reply = _request_response(messages, on_sentence=on_sentence, check=check)
@@ -93,7 +99,7 @@ def respond(text: str, *, on_sentence=None, check=None) -> str:
         return reply
 
 
-def _request_response(messages: list[dict[str, str]], *, on_sentence=None, check=None) -> str:
+def _request_response(messages: list[dict[str, str]], *, on_sentence=None, check=None, task_id=None) -> str:
     base_url = os.environ.get("LLM_BASE_URL", "").strip().rstrip("/")
     model = os.environ.get("LLM_MODEL", "").strip()
     if not base_url or not model:
@@ -124,11 +130,17 @@ def _request_response(messages: list[dict[str, str]], *, on_sentence=None, check
             payload["reasoning_effort"] = reasoning
     if on_sentence is not None or streaming_enabled():
         payload["stream"] = True
+        if task_id and not responses and (url.hostname.endswith(".openai.azure.com")
+                                         or url.hostname in {"api.openai.com", "openrouter.ai"}):
+            payload["stream_options"] = {"include_usage": True}
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     api_key = os.environ.get("LLM_API_KEY", "").strip()
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     used = 0
+    started = time.monotonic()
+    first = None
+    usage = []
     while True:
         if check:
             check()
@@ -136,16 +148,33 @@ def _request_response(messages: list[dict[str, str]], *, on_sentence=None, check
             payload["tools"] = tools
             payload["tool_choice"] = "none" if used >= MAX_TOOL_CALLS else "auto"
         sentences = LineBuffer(on_sentence) if on_sentence else None
+
+        def delta(text):
+            nonlocal first
+            if text and first is None:
+                first = time.monotonic()
+            if sentences:
+                sentences.feed(text)
+
         completion = _responses_completion if responses else _chat_completion
         message = completion(base_url, payload, headers,
-                             on_delta=sentences.feed if sentences else None, check=check)
+                             on_delta=delta if sentences or task_id else None, check=check)
+        if task_id:
+            usage.append(text_usage(message, model, url.hostname))
         calls = message.get("tool_calls")
         if not calls:
             reply = message.get("content")
             if not isinstance(reply, str) or not reply.strip():
                 raise RuntimeError("LLM API returned an empty assistant message")
+            done = time.monotonic()
             if sentences:
                 sentences.finish()
+            if task_id:
+                local = url.hostname in {"localhost", "127.0.0.1", "::1"}
+                TASKS.start(task_id, "process", metrics={
+                    "local": local, "cloud": not local, "total_seconds": done - started,
+                    "first_chunk_seconds": (first or done) - started, **combine_usage(usage),
+                })
             return reply.strip()
         if sentences and sentences.emitted:
             raise RuntimeError("LLM API requested tools after starting the spoken answer")
@@ -230,13 +259,14 @@ def _chat_message(result):
         raise RuntimeError("LLM API returned no assistant message") from None
     if not isinstance(message, dict):
         raise RuntimeError("LLM API returned no assistant message")
-    return message
+    return {**message, **{key: result[key] for key in ("usage", "cost_usd") if key in result}}
 
 
 def _stream_message(response, on_delta=None, check=None):
     content, reasoning, calls = [], [], {}
     data = []
     finished = False
+    usage = {}
     for raw in response:
         if check:
             check()
@@ -254,6 +284,9 @@ def _stream_message(response, on_delta=None, check=None):
         chunk = json.loads(event)
         if "error" in chunk:
             raise RuntimeError("LLM API reported a streaming error")
+        for key in ("usage", "cost_usd"):
+            if chunk.get(key) is not None:
+                usage[key] = chunk[key]
         for choice in chunk.get("choices", []):
             if choice.get("index", 0) != 0:
                 continue
@@ -279,7 +312,7 @@ def _stream_message(response, on_delta=None, check=None):
                 finished = True
     if not finished:
         raise RuntimeError("LLM API stream ended before completion")
-    message = {"role": "assistant", "content": "".join(content)}
+    message = {"role": "assistant", "content": "".join(content), **usage}
     if calls:
         message["tool_calls"] = [calls[index] for index in sorted(calls)]
     if reasoning:

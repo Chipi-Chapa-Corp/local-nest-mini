@@ -748,7 +748,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"task_id": task_id})
                 return
             if path == "/process":
-                task_id = _ensure_task(task_id, source="http")
+                task_id = _ensure_task(task_id, source="http", final_stage="process")
                 text = str(data.get("input", "")).strip()
                 stage = "process"
                 TASKS.start(task_id, stage)
@@ -797,7 +797,8 @@ class Handler(BaseHTTPRequestHandler):
             if path in {"/transcribe", "/turn"}:
                 if not raw:
                     raise ValueError("audio body is required")
-                task_id = _ensure_task(task_id, source="http")
+                final_stage = "transcribe" if path == "/transcribe" else "output"
+                task_id = _ensure_task(task_id, source="http", final_stage=final_stage)
                 lang = str(query.get("lang", ["auto"])[0])
                 stage = "transcribe"
                 TASKS.start(task_id, stage, lang=lang, bytes=len(raw))
@@ -854,6 +855,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    TASKS.enable_history(DATA_DIR / "pipeline-history.sqlite3")
     if TTS_BACKEND == "silero_pocket":
         FAST_TTS.warm()
     if voice_live_enabled():

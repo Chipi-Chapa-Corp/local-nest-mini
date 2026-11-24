@@ -91,6 +91,54 @@ class MonitorTests(unittest.TestCase):
         self.wait_for(task_id, "done")
         self.player.play.assert_called_once_with("http://local/tts/reply.wav", task_id)
 
+    def test_history_survives_a_new_monitor_and_keeps_final_state(self):
+        database = self.root / "history.sqlite3"
+        self.store.enable_history(database)
+        fresh = self.create()
+        task_id = self.ready("A saved question")
+        self.assertEqual(self.request(f"/api/tests/{task_id}/browser", b"")[0], 202)
+        interrupted = self.ready("Stopped question")
+        self.store.cancel(interrupted)
+
+        reloaded = TaskStore()
+        reloaded.enable_history(database)
+        second = start_monitor(reloaded, host="127.0.0.1", port=0,
+                               log_path=self.root / "events")
+        self.addCleanup(second.server_close)
+        self.addCleanup(second.shutdown)
+        self.base = f"http://127.0.0.1:{second.server_port}"
+        self.assertEqual(json.loads(self.request("/api/tasks")[1]), {"tasks": []})
+        status, body = self.request("/api/history")
+        self.assertEqual(status, 200)
+        rows = {task["id"]: task for task in json.loads(body)["tasks"]}
+        self.assertEqual(set(rows), {task_id, interrupted})
+        self.assertNotIn(fresh, rows)
+        self.assertEqual(rows[task_id]["stages"][2]["detail"]["response"],
+                         "I have heard: A saved question")
+        self.assertEqual(rows[task_id]["stages"][-1]["detail"]["transport"], "browser")
+        self.assertEqual(rows[interrupted]["status"], "interrupted")
+        self.assertEqual(self.request(f"/api/tasks/{task_id}/interrupt", b"")[0], 404)
+
+    def test_history_pages_without_duplicates_at_equal_timestamps(self):
+        self.store.enable_history(self.root / "history.sqlite3")
+        for i in range(27):
+            task_id = f"history-{i:02}"
+            self.store.create(task_id, created=1234, source="nest")
+            self.store.finish(task_id, "process", response="Intermediate stage")
+            self.store.finish(task_id, "output")
+        partial = self.store.create(source="nest")["id"]
+        self.store.finish(partial, "process", response="Still generating audio")
+        status, body = self.request("/api/history")
+        self.assertEqual(status, 200)
+        first = json.loads(body)
+        self.assertEqual(len(first["tasks"]), 25)
+        status, body = self.request(f"/api/history?before={first['next']}")
+        self.assertEqual(status, 200)
+        second = json.loads(body)
+        self.assertIsNone(second["next"])
+        self.assertEqual([task["id"] for task in first["tasks"] + second["tasks"]],
+                         [f"history-{i:02}" for i in reversed(range(27))])
+
     def test_russian_input_selects_russian_tts(self):
         self.ready("Привет")
         self.assertEqual(self.synthesize.call_args.args[1], "ru")

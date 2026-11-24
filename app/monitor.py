@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .control import CONTROL
 
@@ -69,7 +70,8 @@ class MonitorHandler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(payload, ensure_ascii=False).encode(), "application/json; charset=utf-8")
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
+        uri = urlparse(self.path)
+        path = uri.path
         if path == "/api/assistant":
             self._json(200, {"silenced": self.control.silenced()})
             return
@@ -92,6 +94,17 @@ class MonitorHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/tasks":
             self._json(200, {"tasks": self.store.snapshot()})
+            return
+        if path == "/api/history":
+            before = parse_qs(uri.query).get("before", [None])[0]
+            history = self.store.history
+            if history is None:
+                self._json(503, {"error": "Pipeline history unavailable"})
+                return
+            try:
+                self._json(200, history.page(before=before))
+            except (sqlite3.Error, OSError, ValueError):
+                self._json(503, {"error": "Could not read pipeline history"})
             return
         if path == "/api/requests":
             self._json(200, {"requests": _recent_requests(self.log_path)})

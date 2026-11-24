@@ -50,7 +50,7 @@ button:focus-visible,summary:focus-visible{outline:2px solid var(--a2);outline-o
 .step-content{min-width:0;flex:1;padding-bottom:18px}.step:last-child .step-content{padding-bottom:0}.stage-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
 .hint{font-size:12px;color:var(--muted);margin-top:4px}.recording{color:var(--bad)}.notice{color:var(--bad);font-size:13px;margin-top:8px;overflow-wrap:anywhere}
 .request-icon{width:16px;height:16px;flex:none;color:var(--a2);margin-top:2px}.request-icon.error{color:var(--bad)}
-.chevron{width:14px;height:14px;color:var(--faint);flex:none;margin-top:3px;transition:transform .15s}details[open] .chevron{transform:rotate(90deg)}
+.chevron{width:14px;height:14px;color:var(--faint);flex:none;margin-top:3px;transition:transform .15s}details[open]>summary>.chevron{transform:rotate(90deg)}
 @media (prefers-reduced-motion:reduce){*,*::after{animation:none!important;transition:none!important}}
 .step{position:relative;min-width:0;display:flex;align-items:flex-start;gap:12px}
 .step:not(:last-child)::before{content:"";position:absolute;left:13px;top:31px;bottom:4px;width:1px;background:var(--card-line)}
@@ -74,7 +74,14 @@ summary:hover{background:var(--card)}
 .what{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .count{color:var(--muted);font-size:13px}
 .when{color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums}
-details[open] .what{white-space:normal}
+details[open]>summary>.what{white-space:normal}
+.history>summary{align-items:center;font-weight:600}
+.history-list{border-top:1px solid var(--card-line)}
+.history-item .flow{padding:4px 20px 16px}
+.history-item .label q{white-space:pre-wrap}
+.history-item .err{margin:0 20px 16px}
+.history-actions{padding:12px 20px}
+.history-actions[hidden]{display:none}
 pre{margin:0;padding:4px 20px 16px;color:var(--muted);font:12.5px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 @keyframes spin{to{transform:rotate(360deg)}}
 @keyframes breathe{50%{box-shadow:0 0 0 7px rgba(95,212,160,0)}}
@@ -103,6 +110,11 @@ pre{margin:0;padding:4px 20px 16px;color:var(--muted);font:12.5px/1.55 ui-monosp
 </header>
 <main>
   <section><div class="section-heading"><h2>Pipelines</h2><div class="actions"><button class="btn" id="assistant-toggle" disabled>Stop assistant</button><button class="btn primary" id="test"></button></div></div><p id="assistant-hint" class="hint" role="status" hidden>Assistant stopped. New Nest requests receive an empty reply immediately. Interception stays active.</p><div id="test-notice" class="notice" role="status"></div><div id="tasks"></div></section>
+  <section><details id="history" class="card history">
+    <summary id="history-toggle">Pipeline history</summary>
+    <div id="history-list" class="history-list"></div>
+    <div id="history-actions" class="history-actions" hidden><button id="history-more" class="btn">Load older requests</button></div>
+  </details></section>
   <section><h2>Recent requests</h2><div id="requests" class="card"></div></section>
 </main>
 <script>
@@ -110,11 +122,12 @@ const $=id=>document.getElementById(id);
 function icon(name,cls=""){return `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="icons.svg#${name}"></use></svg>`}
 const LANG={en:"English",ru:"Russian"};
 const state={paused:false,silenced:null,switching:false,showAll:false,open:new Set(),last:{},tasks:[],recording:null,starting:null,uploading:null,playing:null,messages:new Map()};
+const historyState={tasks:[],open:new Set(),next:null,loading:false,error:"",visibleKey:""};
 const player=new Audio();
 const MAX_RECORDING_MS=60000;
 
 function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
-function q(text){const t=String(text??""),s=t.length>70?t.slice(0,68).trimEnd()+"…":t;return `<q title="${esc(t)}">${esc(s)}</q>`}
+function q(text,full=false){const t=String(text??""),s=!full&&t.length>70?t.slice(0,68).trimEnd()+"…":t;return `<q title="${esc(t)}">${esc(s)}</q>`}
 function clock(ts){return new Date(ts*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"})}
 function secs(a,b){return Number.isFinite(a)&&Number.isFinite(b)?`${Math.max(0,b-a).toFixed(1)} s`:""}
 
@@ -152,15 +165,15 @@ function stageMetrics(stage){
   return fields.length?`<div class="hint"${m.timing_scope?` title="${esc(m.timing_scope)}"`:""}>${fields.join(" · ")}</div>`:"";
 }
 
-function steps(task){
+function steps(task,archived=false){
   const by=Object.fromEntries((task.stages||[]).map(s=>[s.name,s]));
   const test=task.meta?.source==="browser_test";
-  const finished=!["loading","waiting"].includes(task.status);
+  const finished=archived||!["loading","waiting"].includes(task.status);
   const tr=by.transcribe?.detail||{},pr=by.process?.detail||{},out=by.output?.detail||{},tts=by.tts?.detail||{};
   const defs=[
     ["received",test?"mic":"cast",test?"Recording received":"Received input from Nest",test?"Uploading recording…":"Receiving input from Nest…",test?"Recording":"Waiting for Nest"],
-    ["transcribe","text-align-start",tr.text?`Transcribed input: ${q(tr.text)}`:"Heard nothing","Transcribing…","Transcribe"],
-    ["process","sparkles",`Generated response: ${q(pr.response)} in ${esc(LANG[pr.lang]||pr.lang||"auto")}`,"Generating response…","Generate response"],
+    ["transcribe","text-align-start",tr.text?`Transcribed input: ${q(tr.text,archived)}`:"Heard nothing","Transcribing…","Transcribe"],
+    ["process","sparkles",`Generated response: ${q(pr.response,archived)} in ${esc(LANG[pr.lang]||pr.lang||"auto")}`,"Generating response…","Generate response"],
     ["tts","audio-lines",tts.engine?`Converted to audio with ${esc(tts.engine)}`:"Converted to audio",tts.engine?`Converting to audio with ${esc(tts.engine)}…`:"Converting to audio…","Convert to audio"],
     ["output",test?"volume-2":"cast",test?(out.transport==="browser"?"Played in browser":"Cast to Nest"):out.result?"Closed quietly, nothing to say":"Spoken via Nest",test?"Casting to Nest…":"Sending to Nest…",test?"Playback":"Speak via Nest"],
   ];
@@ -172,7 +185,7 @@ function steps(task){
     else if(cls==="error")label=`${esc(idle)} failed`;
     else if(cls==="interrupted"){cls="error";label="Interrupted";}
     else label=cls==="skipped"?`${esc(idle)} · skipped`:esc(idle);
-    if(test&&name==="output"&&cls==="waiting")label="Ready to play";
+    if(test&&name==="output"&&cls==="waiting")label=archived?"Playback pending":"Ready to play";
     let controls="";
     if(!test&&name==="output"&&Number.isFinite(out.speech_to_native_ms)){
       controls=`<div class="hint">First audio sent about ${secs(0,out.speech_to_native_ms/1000)} after speech ended</div>`;
@@ -180,13 +193,13 @@ function steps(task){
     if(["transcribe","process","tts"].includes(name))controls=stageMetrics(st);
     if(name==="tts"&&tts.cpu_reason&&tts.metrics?.vram_free_mib==null)
       controls+=`<div class="hint">CPU because ${esc(tts.cpu_reason)}</div>`;
-    if(test&&!task.interrupt_requested&&name==="received"&&st?.status==="waiting"){
+    if(test&&!archived&&!task.interrupt_requested&&name==="received"&&st?.status==="waiting"){
       const active=state.recording?.id===task.id,starting=state.starting===task.id;
       if(active){cls="recording";label="Recording…";}
       const disabled=!!state.starting||!!state.uploading||!!state.recording&&!active;
       controls=`<div class="stage-actions"><button class="btn ${active?"recording":""}" data-record="${esc(task.id)}" ${disabled?"disabled":""}>${icon(active?"square":"mic")}${active?"Stop recording":starting?"Opening microphone…":"Record"}</button></div><div class="hint">${active?"Click stop when finished · 60 second limit":"Record a message using your browser microphone"}</div>`;
     }
-    if(test&&!task.interrupt_requested&&name==="output"&&by.tts?.status==="done"){
+    if(test&&!archived&&!task.interrupt_requested&&name==="output"&&by.tts?.status==="done"){
       const busy=st?.status==="loading",playing=state.playing===task.id;
       controls=`<div class="stage-actions"><button class="btn" data-cast="${esc(task.id)}" ${busy||playing?"disabled":""}>${icon("cast")}Cast to Nest</button><button class="btn" data-play="${esc(task.id)}" ${busy?"disabled":""}>${icon(playing?"square":"play")}${playing?"Stop":"Play"}</button></div>`;
       if(playing)label="Playing in browser…";
@@ -198,13 +211,21 @@ function steps(task){
   });
 }
 
+function visibleTasks(){return state.showAll?state.tasks:state.tasks.slice(0,5)}
+
+function taskFlow(task,archived=false){
+  return steps(task,archived).map(s=>`<div class="step ${s.cls}"><div class="node">${icon(s.glyph)}</div><div class="step-content"><div class="step-heading"><div class="label">${s.label}</div>${s.duration?`<span class="duration" aria-label="Step duration">${s.duration}</span>`:""}</div>${s.controls}</div></div>`).join("");
+}
+
 function renderTasks(tasks=state.tasks){
   state.tasks=tasks;
+  if($("history").open&&historyState.visibleKey!==JSON.stringify(visibleTasks().map(task=>task.id)))
+    renderHistory();
   if(!tasks.length){$("tasks").innerHTML='<div class="card empty">No pipelines yet. Say “Hey Google, …” or click Test.</div>';return}
-  const shown=state.showAll?tasks:tasks.slice(0,5);
+  const shown=visibleTasks();
   $("tasks").innerHTML=shown.map(task=>{
     const test=task.meta?.source==="browser_test";
-    const flow=steps(task).map(s=>`<div class="step ${s.cls}"><div class="node">${icon(s.glyph)}</div><div class="step-content"><div class="step-heading"><div class="label">${s.label}</div>${s.duration?`<span class="duration" aria-label="Step duration">${s.duration}</span>`:""}</div>${s.controls}</div></div>`).join("");
+    const flow=taskFlow(task);
     const end=["done","error","interrupted"].includes(task.status)?secs(task.created,task.updated):"";
     const stop=["loading","waiting"].includes(task.status)?`<button class="icon" title="Interrupt" aria-label="Interrupt pipeline" data-stop="${esc(task.id)}">${icon("square")}</button>`:"";
     const err=task.error?`<div class="err" role="status">${esc(task.error.message)}</div>`:"";
@@ -216,6 +237,58 @@ function renderTasks(tasks=state.tasks){
   document.querySelectorAll("[data-cast]").forEach(b=>b.onclick=()=>action(b.dataset.cast,"cast"));
   document.querySelectorAll("[data-play]").forEach(b=>b.onclick=()=>play(b.dataset.play));
   if($("more"))$("more").onclick=()=>{state.showAll=!state.showAll;renderTasks()};
+}
+
+function historyItem(task){
+  const by=Object.fromEntries(task.stages.map(stage=>[stage.name,stage.detail]));
+  const question=by.transcribe?.text||by.process?.input||by.process?.text||by.tts?.text||"Pipeline";
+  const stamp=new Date(task.created*1000).toLocaleString([],{dateStyle:"medium",timeStyle:"short"});
+  const failed=["error","interrupted"].includes(task.status);
+  const glyph=failed?"alert-circle":task.meta?.source==="browser_test"?"flask-conical":"cast";
+  const error=task.error?`<div class="err">${esc(task.error.message)}</div>`:"";
+  return `<details class="history-item" data-history-id="${esc(task.id)}"${historyState.open.has(task.id)?" open":""}><summary>${icon("chevron-right","chevron")}${icon(glyph,"request-icon"+(failed?" error":""))}<span class="what">${esc(question)}</span><time class="when">${esc(stamp)}</time></summary><div class="flow">${taskFlow(task,true)}</div>${error}</details>`;
+}
+
+function renderHistory(){
+  const visible=visibleTasks().map(task=>task.id);
+  historyState.visibleKey=JSON.stringify(visible);
+  const live=new Set(visible);
+  const older=historyState.tasks.filter(task=>!live.has(task.id));
+  const list=$("history-list");
+  if(older.length){
+    list.innerHTML=older.map(historyItem).join("");
+    list.querySelectorAll("[data-history-id]").forEach(row=>row.addEventListener("toggle",()=>{
+      const id=row.dataset.historyId;
+      if(row.open)historyState.open.add(id);
+      else historyState.open.delete(id);
+    }));
+  }else{
+    list.innerHTML=`<div class="empty" role="status">${historyState.loading?"Loading history…":"No older pipelines yet."}</div>`;
+  }
+  if(historyState.error)list.insertAdjacentHTML("beforeend",
+    `<div class="empty" role="status">${esc(historyState.error)}</div>`);
+  $("history-actions").hidden=!historyState.next&&!historyState.error;
+  $("history-more").disabled=historyState.loading;
+  $("history-more").textContent=historyState.error?"Retry":"Load older requests";
+}
+
+async function loadHistory(before=null){
+  if(historyState.loading)return;
+  historyState.loading=true;
+  historyState.error="";
+  renderHistory();
+  try{
+    const response=await fetch(before?`api/history?before=${encodeURIComponent(before)}`:"api/history");
+    if(!response.ok)throw new Error("Could not load pipeline history.");
+    const page=await response.json();
+    historyState.tasks=before?[...historyState.tasks,...page.tasks]:page.tasks;
+    historyState.next=page.next;
+  }catch(error){
+    historyState.error=error.message;
+  }finally{
+    historyState.loading=false;
+    renderHistory();
+  }
 }
 
 async function api(path,body){
@@ -314,7 +387,7 @@ function renderRequests(events){
   }
   if(!groups.length){$("requests").innerHTML='<div class="empty">Nothing yet.</div>';return}
   $("requests").innerHTML=groups.map(g=>`<details data-key="${esc(g.key)}"${state.open.has(g.key)?" open":""}><summary>${icon("chevron-right","chevron")}${icon(requestIcon(g.e),"request-icon"+(/error/.test(g.e.kind)?" error":""))}<span class="what">${esc(g.what)}</span>${g.count>1?`<span class="count">×${g.count}</span>`:""}<span class="when">${clock(Date.parse(g.e.time)/1000)}</span></summary><pre>${esc(JSON.stringify(g.e,null,2))}</pre></details>`).join("");
-  document.querySelectorAll("details").forEach(el=>el.addEventListener("toggle",()=>el.open?state.open.add(el.dataset.key):state.open.delete(el.dataset.key)));
+  $("requests").querySelectorAll("details").forEach(el=>el.addEventListener("toggle",()=>el.open?state.open.add(el.dataset.key):state.open.delete(el.dataset.key)));
 }
 
 function setStatus(cls,text){$("status").className="status "+cls;$("status-text").textContent=text}
@@ -347,6 +420,9 @@ function setPause(p){state.paused=p;$("pause").innerHTML=icon(p?"play":"pause");
 $("pause").onclick=()=>setPause(!state.paused);
 $("refresh").onclick=refresh;
 $("refresh").innerHTML=icon("refresh-cw");
+$("history-toggle").insertAdjacentHTML("afterbegin",icon("chevron-right","chevron"));
+$("history").addEventListener("toggle",()=>{if($("history").open)loadHistory()});
+$("history-more").onclick=()=>loadHistory(historyState.next);
 $("test").innerHTML=icon("flask-conical")+"Test";
 $("test").onclick=async()=>{
   $("test").disabled=true;$("test-notice").textContent="";

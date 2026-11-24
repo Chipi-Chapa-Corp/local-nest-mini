@@ -1,12 +1,19 @@
-"""In-memory task state for the local assistant and its monitor UI."""
+"""Live task state for the local assistant and its monitor UI."""
 
 from __future__ import annotations
 
 import copy
+import logging
+import sqlite3
 import threading
 import time
 import uuid
 from collections import OrderedDict
+from pathlib import Path
+
+from .task_history import TaskHistory
+
+_log = logging.getLogger(__name__)
 
 
 class TaskCancelled(RuntimeError):
@@ -23,7 +30,18 @@ class TaskStore:
         self._tasks: OrderedDict[str, dict] = OrderedDict()
         self._cancel: dict[str, threading.Event] = {}
         self._procs: dict[str, list] = {}
+        self.history: TaskHistory | None = None
         self.limit = limit
+
+    def enable_history(self, path: Path) -> None:
+        with self._lock:
+            try:
+                self.history = TaskHistory(path)
+            except (OSError, sqlite3.Error):
+                _log.exception("Could not open pipeline history")
+                return
+            for task in self._tasks.values():
+                self._archive(task)
 
     def create(self, task_id: str | None = None, *, created: float | None = None, **meta) -> dict:
         task_id = str(task_id or uuid.uuid4().hex)
@@ -72,6 +90,14 @@ class TaskStore:
         else:
             task["status"] = "done"
         task["updated"] = now()
+        self._archive(task)
+
+    def _archive(self, task: dict) -> None:
+        if self.history is not None:
+            try:
+                self.history.save(task)
+            except (OSError, sqlite3.Error, TypeError, ValueError):
+                _log.exception("Could not save pipeline history")
 
     def start(self, task_id: str, name: str, **detail) -> dict:
         return self.stage(task_id, name, "loading", **detail)
